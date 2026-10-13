@@ -556,6 +556,26 @@ def declared_entries(source, disc):
     return entries
 
 
+def declared_dispatch_entries(source):
+    """Re-entry PCs that receive control by dispatch, never by a call.
+
+    An exception return, a thread resume or a computed jump can land on any
+    instruction of a function. Such a PC proves reachability, not a callable
+    boundary, so it is dispatch evidence only: the classifier aliases it into
+    its CFG host, or roots it only on its own boundary proof. As a walk seed it
+    would hard-cap the host and orphan the code reached across it.
+    """
+    body, base = source['body'], source['base']
+    entries = {number(x) for x in source['spec'].get('dispatch_entries', [])}
+    require(all(base <= entry < base + len(body) and entry % 4 == 0 for entry in entries),
+            f"Dispatch entry outside image: {source['name']}")
+    return entries
+
+
+def required_entries(source, disc):
+    return declared_entries(source, disc) | declared_dispatch_entries(source)
+
+
 def make_fixed_record(source, disc):
     body, base, spec = source['body'], source['base'], source['spec']
     require(spec.get('allow_missing'), f"Generic extractor missed required image: {source['name']}")
@@ -656,6 +676,12 @@ def prepare(profile, disc, records, output, views=None):
                 record[key] = [hex(pc) for pc in sorted(entries | {number(pc) for pc in record[key]})]
             record['static_discovery_entry_pcs'] = [hex(pc) for pc in sorted(entries |
                 {number(pc) for pc in record.get('static_discovery_entry_pcs', [])})]
+        resumes = declared_dispatch_entries(source)
+        if resumes:
+            require(source['name'] in singles, 'Declared dispatch entries need a complete source recipe')
+            record = singles[source['name']]
+            for key in ('dispatch_entry_pcs', 'static_dispatch_entry_pcs'):
+                record[key] = [hex(pc) for pc in sorted(resumes | {number(pc) for pc in record[key]})]
     by_name = {source['name']: source for source in sources}
     keys = {(number(r['load_addr']), r['bytes_b64']) for r in records}
     for composition in profile.get('compositions', []):
@@ -686,7 +712,7 @@ def prepare(profile, disc, records, output, views=None):
                 if any(lo <= number(alias['start']) <= number(alias['entry']) < number(alias['end']) <= hi
                        for lo, hi in bounds)]
             require(all(eligible(entry) for source, _, _ in matches
-                        for entry in declared_entries(source, disc)), 'Excluded required loader entry')
+                        for entry in required_entries(source, disc)), 'Excluded required loader entry')
         if record.get('producer') == 'bios_resident_manifest':
             names = ['BIOS resident manifest']
             bounds = [(number(r['start']), number(r['end'])) for r in record['producer_ranges']]
@@ -702,7 +728,7 @@ def prepare(profile, disc, records, output, views=None):
         write_json(path, [record])
         jobs.append(dict(name=f'{index:03d}-' + '+'.join(names), sources=names,
                          required_entries=sorted({entry for source, _, _ in matches
-                                                  for entry in declared_entries(source, disc)}),
+                                                  for entry in required_entries(source, disc)}),
                          known_ranges=bounds, input=str(path.resolve()), load_addr=hex(load),
                          size=len(data), sha256=hashlib.sha256(data).hexdigest(),
                          recipe_sha256=hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest(),

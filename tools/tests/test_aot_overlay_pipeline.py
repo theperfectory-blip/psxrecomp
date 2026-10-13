@@ -531,6 +531,46 @@ class AotMethodsTest(unittest.TestCase):
                     pipeline.prepare(dict(images=[spec], expected_records=1, strict_bounds=strict),
                                      FakeDisc({'CODE': body}), [dict(record)], Path(directory))
 
+    def test_dispatch_entry_aliases_its_host_without_splitting_it(self):
+        # A resume PC inside a framed function (an exception return lands on
+        # any instruction). It must stay an alias of the whole host: as a walk
+        # seed it would cap the host and orphan the code branched across it.
+        base = 0x80100000
+        body = struct.pack('<12I',
+                           0x27BDFFF8,              # addiu sp,sp,-8
+                           0x10000004, 0,           # b base+0x18 ; nop
+                           0x24020001,              # base+0x0C: addiu v0,zero,1
+                           0x10000005, 0,           # b base+0x28 ; nop
+                           0x24030002,              # base+0x18: addiu v1,zero,2
+                           0x24040003,              # base+0x1C: addiu a0,zero,3 (resume)
+                           0x1000FFFA, 0,           # b base+0x0C ; nop
+                           0x03E00008, 0x27BD0008)  # base+0x28: jr ra ; addiu sp,sp,8
+        resume = base + 0x1C
+        spec = dict(method='fixed_address_files', files=['CODE'], load_addr=hex(base),
+                    allow_missing=True, dispatch_entries=[hex(resume)])
+        record = pipeline.extractor.rec(base, body, [base])
+        with tempfile.TemporaryDirectory() as directory:
+            disc = FakeDisc({'CODE': body})
+            disc.binary = Path(directory) / 'source.bin'; disc.binary.write_bytes(body)
+            inventory = pipeline.prepare(dict(game_id='TEST', images=[spec], expected_records=1,
+                                              strict_bounds=True), disc, [dict(record)], Path(directory))
+            job, = inventory['jobs']
+            prepared, = json.loads(Path(job['input']).read_text())
+        self.assertEqual(job['required_entries'], [resume])
+        self.assertIn(hex(resume), prepared['dispatch_entry_pcs'])
+        self.assertIn(hex(resume), prepared['static_dispatch_entry_pcs'])
+        for key in ('function_entry_pcs', 'seeds', 'static_discovery_entry_pcs'):
+            self.assertNotIn(resume, {int(pc, 16) for pc in prepared.get(key, [])}, key)
+        seeds, audit = pipeline.compiler.classify_overlay_seeds(
+            prepared, body, base, len(body), 0, {})
+        self.assertEqual(audit['included_reasons'][resume], 'DISPATCH_INTERIOR')
+        self.assertIn(f'interior 0x{resume:08X}', seeds)
+        self.assertNotIn(f'0x{resume:08X}', seeds)
+        self.assertNotIn(f'call_root 0x{resume:08X}', seeds)
+        with self.assertRaisesRegex(ValueError, 'Dispatch entry outside image'):
+            pipeline.declared_dispatch_entries(dict(name='CODE', base=base, body=body,
+                                                    spec=dict(dispatch_entries=[hex(base + 2)])))
+
     def test_optional_normal_roots_reject_control_transfer_in_delay_slot(self):
         base = 0x80100000
         body = struct.pack('<8I', 0, 0, 0x0C004000, 0x0C004001,
