@@ -310,6 +310,71 @@ def check_scheduled_jump_table_discovery():
         assert resolve(broken) == set(), name
 
 
+def check_split_base_jump_table_discovery():
+    # PsyQ GCC %hi/%lo form: the base LUI sits between SLL and ADDU, %lo rides
+    # in the LW, and the guard's delay slot holds unrelated scheduled work.
+    data = bytearray(0x9000)
+    for offset, word in (
+        (0x508, 0x2C620003),  # sltiu v0,v1,3
+        (0x50C, 0x1040001C),  # beq v0,zero,+0x580
+        (0x510, 0x00C5A821),  # addu s5,a2,a1 (guard delay slot)
+        (0x514, 0x00031080),  # sll v0,v1,2
+        (0x518, 0x3C018001),  # lui at,0x8001
+        (0x51C, 0x00220821),  # addu at,at,v0
+        (0x520, 0x8C220A00),  # lw v0,0xa00(at)
+        (0x528, 0x00400008),  # jr v0
+        (0x580, 0x03E00008),
+    ):
+        put(data, offset, word)
+    cases = {LOAD + off for off in (0x540, 0x550, 0x560)}
+    for i, target in enumerate(sorted(cases)):
+        put(data, 0xA00 + i * 4, target)
+        put(data, 0x8A00 + i * 4, target)
+        put(data, target - LOAD, 0x24020001 + i)
+        put(data, target - LOAD + 4, 0x03E00008)
+
+    def resolve(image, jr=0x528):
+        return MOD._find_jump_table_targets(
+            image, LOAD, len(image), LOAD + 0x500, LOAD + 0x600,
+            LOAD + jr, 2)
+
+    assert resolve(data) == cases
+    nop_delay = bytearray(data)
+    put(nop_delay, 0x510, 0)
+    assert resolve(nop_delay) == cases
+    signed_low = bytearray(data)
+    put(signed_low, 0x518, 0x3C018002)  # lui at,0x8002
+    put(signed_low, 0x520, 0x8C228A00)  # lw v0,-0x7600(at)
+    assert resolve(signed_low) == cases
+    walk = MOD._walk_overlay_function(
+        data, LOAD, len(data), LOAD + 0x500, LOAD + 0x600)
+    assert walk['jump_table_targets'] == cases
+    assert cases <= walk['visited']
+
+    no_load_delay = bytearray(data)
+    put(no_load_delay, 0x524, 0x00400008)
+    assert resolve(no_load_delay, 0x524) == set()
+
+    def jump(offset):
+        return 0x08000000 | (((LOAD + offset) >> 2) & 0x03FFFFFF)
+
+    for name, mutations in (
+        ('delay slot overwrites index', ((0x510, 0x24030000),)),
+        ('delay slot loads index', ((0x510, 0x8E030000),)),
+        ('delay slot transfers', ((0x510, jal(LOAD + 0x580)),)),
+        ('LUI defines a foreign register', ((0x518, 0x3C088001),)),
+        ('reserved LUI fields', ((0x518, 0x3C218001),)),
+        ('edge skips the bound', ((0x590, jump(0x514)),)),
+        ('edge skips the base', ((0x590, jump(0x51C)),)),
+        ('case skips the bound', ((0x540, jump(0x514)), (0x544, 0))),
+        ('table target inside the suffix', ((0xA00, LOAD + 0x51C),)),
+    ):
+        broken = bytearray(data)
+        for offset, word in mutations:
+            put(broken, offset, word)
+        assert resolve(broken) == set(), name
+
+
 def check_composite_call_boundaries():
     data = bytearray(0x100)
     cross_target = LOAD + 0x50
@@ -3932,6 +3997,7 @@ def main():
     check_composite_call_boundaries()
     check_bounded_jump_table_discovery()
     check_scheduled_jump_table_discovery()
+    check_split_base_jump_table_discovery()
     check_static_discovery_provenance()
     check_static_dispatch_provenance()
     check_owned_direct_call_is_interior()

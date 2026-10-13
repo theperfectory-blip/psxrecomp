@@ -1165,6 +1165,11 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
     That exact pair may not overwrite the checked index, and direct edges
     may not bypass the bound (including edges from switch cases).
 
+    Also accept the %hi/%lo split base ``sll; lui base,%hi; addu address,
+    base,scaled; lw target,%lo(address); nop; jr``. The guard's delay slot
+    may then hold any non-transfer that leaves the index intact, and no edge
+    may enter between the bound and the JR.
+
     ``table_base`` must be a nearest-definition LUI, optionally followed by a
     nearest-definition ADDIU.  The lower instruction may rename the
     register (``lui v0; addiu s0,v0,lo``), as used by Ape Escape.  Any other
@@ -1207,7 +1212,16 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
     addu_inputs = ((addu_word >> 21) & 0x1F,
                    (addu_word >> 16) & 0x1F)
 
+    # %hi/%lo split base (PsyQ GCC): ``sll; lui base,%hi; addu; lw %lo(addr)``.
+    # The LUI defines the ADDU's base operand directly; %lo rides in the LW.
     sll_pc = addu_pc - 4
+    split_word = _word_at(data, load_addr, sll_pc)
+    split_base = (split_word is not None and (split_word >> 26) == 0x0F and
+                  ((split_word >> 21) & 0x1F) == 0 and
+                  ((split_word >> 16) & 0x1F) in addu_inputs and
+                  ((split_word >> 16) & 0x1F) != 0)
+    if split_base:
+        sll_pc -= 4
     sll_word = _word_at(data, load_addr, sll_pc)
     if sll_word is None or ((sll_word >> 26) & 0x3F) != 0 \
             or (sll_word & 0x3F) != 0 \
@@ -1221,11 +1235,24 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
     table_reg = addu_inputs[1] if addu_inputs[0] == scaled_reg else addu_inputs[0]
     if not table_reg or table_reg == scaled_reg:
         return set()
+    if split_base and ((split_word >> 16) & 0x1F) != table_reg:
+        return set()
 
     # The bound must guard this exact index on the sole fallthrough into SLL.
     sltiu_pc = sll_pc - 12
     branch_pc = sll_pc - 8
-    scheduled_base = _word_at(data, load_addr, sll_pc - 4) != 0
+    guard_delay = _word_at(data, load_addr, sll_pc - 4)
+    scheduled_base = guard_delay != 0 and not split_base
+    if split_base:
+        # R3000 load delay: JR must not consume the immediately preceding LW.
+        if lw_pc != jr_pc - 8:
+            return set()
+        # The guard's delay slot runs on both paths; with the base defined
+        # after SLL it may hold any non-transfer that leaves the index intact.
+        if (guard_delay is None or not _is_valid_mips_word(guard_delay) or
+                _is_control_flow(guard_delay) or
+                _instruction_writes_gpr(guard_delay, index_reg)):
+            return set()
     if scheduled_base:
         # R3000 load delay: JR must not consume the immediately preceding LW.
         if lw_pc != jr_pc - 8:
@@ -1259,10 +1286,13 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
     branch_rt = (branch_word >> 16) & 0x1F
     if {branch_rs, branch_rt} != {0, guard_reg}:
         return set()
+    # With the base defined inside the guarded suffix, every edge into
+    # (SLTIU, JR] would skip either the bound or the base: protect it all.
+    strict_suffix = scheduled_base or split_base
     reject_target = _branch_target(branch_pc, branch_word)
     if (not (entry <= reject_target < hard_cap) or
             sll_pc <= reject_target < jr_pc + 8 or
-            (scheduled_base and sltiu_pc < reject_target < jr_pc + 8)):
+            (strict_suffix and sltiu_pc < reject_target < jr_pc + 8)):
         return set()
 
     def nearest_writer(reg: int, before: int):
@@ -1304,6 +1334,8 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
     if scheduled_base and (constant_pc != branch_pc + 4 or
                            table_def_pc != sll_pc - 4):
         return set()
+    if split_base and table_def_pc != sll_pc + 4:
+        return set()
 
     # Calls could clobber the proven constant.  Other branches could enter the
     # suffix through an unproved path.  The one exact bounds branch is allowed.
@@ -1328,7 +1360,7 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
         target = _word_at(data, load_addr, table_base + index * 4)
         if (target is None or (target & 3) or
                 not (entry <= target < hard_cap) or
-                (scheduled_base and sltiu_pc < target < jr_pc + 8) or
+                (strict_suffix and sltiu_pc < target < jr_pc + 8) or
                 not (range_lo <= target < range_hi) or
                 not _is_valid_mips_word(_word_at(data, load_addr, target))):
             return set()
@@ -1370,7 +1402,7 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
         elif kind in ('jr', 'jr_ra'):
             case_reachable.add(delay)
 
-    protected_pc = sltiu_pc if scheduled_base else constant_pc
+    protected_pc = sltiu_pc if strict_suffix else constant_pc
     for source in range(entry, hard_cap, 4):
         source_word = _word_at(data, load_addr, source)
         if source_word is None:
@@ -1379,7 +1411,7 @@ def _find_jump_table_targets(data: bytes, load_addr: int, size: int,
         if (kind in ('branch', 'j', 'jal') and
                 protected_pc < target <= jr_pc and
                 not (protected_pc <= source <= jr_pc) and
-                (scheduled_base or source not in case_reachable)):
+                (strict_suffix or source not in case_reachable)):
             return set()
     if proof_out is not None:
         proof_out.append({
