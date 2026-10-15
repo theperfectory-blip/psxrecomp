@@ -187,10 +187,96 @@ void check_scheduled_switch() {
     }
 }
 
+// PsyQ GCC %hi/%lo split base, as in WE2002 GAME.BIN 0x80083E98:
+// sltiu; beq; sw ra (work in the guard delay); sll; lui at,%hi; addu at,at,v0;
+// lw v0,%lo(at); nop; jr v0.
+ApeSwitchFixture make_split_switch() {
+    auto f = make_ape_switch();
+    const size_t text = 2048;
+    put32(f.image, text + 0x500, 0);
+    put32(f.image, text + 0x504, 0);
+    put32(f.image, text + 0x508, 0x2C620003u); // sltiu v0,v1,3
+    put32(f.image, text + 0x50C, 0x1040001Cu); // beq v0,zero,+0x580
+    put32(f.image, text + 0x510, 0xAFBF0010u); // sw ra,16(sp) (guard delay)
+    put32(f.image, text + 0x514, 0x00031080u); // sll v0,v1,2
+    put32(f.image, text + 0x518, 0x3C018001u); // lui at,0x8001
+    put32(f.image, text + 0x51C, 0x00220821u); // addu at,at,v0
+    put32(f.image, text + 0x520, 0x8C220A00u); // lw v0,0x0a00(at)
+    return f;
+}
+
+void check_split_switch() {
+    const size_t text = 2048;
+    auto f = make_split_switch();
+    auto exe = parse(f.image);
+    PSXRecomp::ExactJumpTable table;
+    CHECK(PSXRecomp::resolve_exact_bounded_jump_table(
+              exe, f.entry, kLoad + 0x600u, f.jr_pc, 2u, table) &&
+          table.table_base == f.table && table.table_count == 3u,
+          "split-base table constant resolves exactly");
+    std::set<uint32_t> targets;
+    for (auto target : table.targets) targets.insert(target.second);
+    CHECK(targets == std::set<uint32_t>(f.cases.begin(), f.cases.end()),
+          "split-base table has exactly the expected case targets");
+    PSXRecomp::FunctionAnalyzer analyzer(exe);
+    auto result = analyzer.analyze_exact_entries({f.entry});
+    for (auto target : f.cases)
+        CHECK(result.exact_reachable_pcs.count(target),
+              "split-base switch cases are reached from the function root");
+
+    auto nop_delay = f;
+    put32(nop_delay.image, text + 0x510, 0);
+    CHECK(resolves_ape_switch(nop_delay, f.entry),
+          "split-base guard delay may be a nop");
+    auto swapped = f;
+    put32(swapped.image, text + 0x51C, 0x00410821u); // addu at,v0,at
+    CHECK(resolves_ape_switch(swapped, f.entry),
+          "split-base ADDU operand order is free");
+    auto signed_low = f;
+    signed_low.image.resize(text + 0x9000u);
+    put32(signed_low.image, 0x1C, 0x9000u);
+    put32(signed_low.image, text + 0x518, 0x3C018002u); // lui at,0x8002
+    put32(signed_low.image, text + 0x520, 0x8C228A00u); // lw v0,-0x7600(at)
+    for (size_t i = 0; i < f.cases.size(); ++i)
+        put32(signed_low.image, text + 0x8A00u + 4u * i, f.cases[i]);
+    CHECK(resolves_ape_switch(signed_low, f.entry, kLoad, kLoad + 0x9000u),
+          "split-base LW sign-extends its %lo half");
+    auto no_load_delay = f;
+    no_load_delay.jr_pc = kLoad + 0x524u;
+    put32(no_load_delay.image, text + 0x524, 0x00400008u);
+    CHECK(!resolves_ape_switch(no_load_delay, f.entry),
+          "split-base switch must respect the R3000 load delay");
+
+    auto jump = [](uint32_t offset) {
+        return 0x08000000u | (((kLoad + offset) >> 2) & 0x03FFFFFFu);
+    };
+    const std::vector<std::vector<std::pair<size_t, uint32_t>>> mutations = {
+        {{0x510, 0x24630001u}}, // guard delay writes index
+        {{0x510, jump(0x580)}}, // guard delay is a transfer
+        {{0x518, 0x3C088001u}}, // LUI defines a register ADDU never reads
+        {{0x518, 0x3C228001u}}, // reserved LUI fields
+        {{0x51C, 0x00220823u}}, // SUBU instead of ADDU
+        {{0x50C, 0x10400002u}}, // reject into the split LUI
+        {{0x500, jump(0x518)}}, // earlier edge skips bound and base
+        {{0x590, jump(0x51C)}}, // later edge skips the base
+        {{0x540, jump(0x518)}, {0x544, 0}}, // case skips bound
+        {{0xA00, kLoad + 0x518u}}, // case target skips bound
+        {{0xA04, kLoad + 0x2000u}}, // out of host
+    };
+    for (const auto& changes : mutations) {
+        auto broken = f;
+        for (auto change : changes)
+            put32(broken.image, text + change.first, change.second);
+        CHECK(!resolves_ape_switch(broken, broken.entry),
+              "unsafe split-base mutation fails closed");
+    }
+}
+
 } // namespace
 
 int main() {
     check_scheduled_switch();
+    check_split_switch();
     auto image = make_exe_buffer(0x2000);
     const size_t text = 2048;
 

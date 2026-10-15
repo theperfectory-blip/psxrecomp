@@ -518,7 +518,7 @@ def capture_segment_views(cap: dict,
             view['static_dispatch_entry_pcs'] = respell_list(
                 cap['static_dispatch_entry_pcs'], seg, entries)
         for field in ('executed_pcs', 'observed_pcs', 'function_entry_pcs',
-                      'static_discovery_entry_pcs',
+                      'static_discovery_entry_pcs', 'resident_call_entry_pcs',
                       'static_call_continuation_pcs'):
             if field in cap:
                 view[field] = respell_list(cap[field], seg)
@@ -1026,6 +1026,7 @@ def optional_enrichment_fallback_capture(cap: dict) -> dict | None:
         fallback['static_discovery_entry_pcs'] = encoded
         fallback['seeds'] = encoded
     fallback.pop('static_alias_ranges', None)
+    fallback.pop('resident_call_entry_pcs', None)
     fallback.pop('static_jump_table_proofs', None)
     fallback.pop('static_call_continuation_pcs', None)
     fallback.pop('_prior_aliases', None)
@@ -1872,6 +1873,10 @@ def _collect_toml_overlay_entries(toml_doc: dict, load_addr: int, crc32: int,
     return entries
 
 
+# Longest straight-line run a resident call may sit above an existing root.
+RESIDENT_HEAD_MAX_WORDS = 8
+
+
 def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
                            crc32: int, toml_doc: dict) -> tuple[list[str], dict]:
     lo = load_addr
@@ -1957,6 +1962,8 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     static_discovery_entries = _parse_addr_list(
         cap.get('static_discovery_entry_pcs', []))
     toml_entries = _collect_toml_overlay_entries(toml_doc, load_addr, crc32, data)
+    resident_call_entries = _parse_addr_list(
+        cap.get('resident_call_entry_pcs', []))
     legacy_callable_seeds = {a for a in legacy_seeds
                              if region(a) and _callable_legacy_seed(data, load_addr, a)}
 
@@ -1977,6 +1984,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     pre_roots.update(a for a in dispatch_entry_pcs
                      if region(a) and _callable_legacy_seed(data, load_addr, a))
     jump_table_targets = set()
+    pre_walk_visited = set()
     pre_roots_sorted = sorted(a for a in pre_roots if region(a))
     for i, entry in enumerate(pre_roots_sorted):
         hard_cap = pre_roots_sorted[i + 1] if i + 1 < len(pre_roots_sorted) else hi
@@ -1984,6 +1992,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             data, load_addr, size, entry, hard_cap, producer_ranges,
             allow_cross_producer_calls)
         jump_table_targets.update(walk['jump_table_targets'])
+        pre_walk_visited.update(walk['visited'])
 
     def impossible_entry_start(addr: int) -> bool:
         word = _word_at(data, load_addr, addr)
@@ -2074,6 +2083,42 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
             include(addr, 'FUNCTION_POINTER_TARGET')
     for addr in toml_entries:
         include(addr, 'TOML_DECLARED_ENTRY')
+
+    # Direct calls from the resident boot EXE into this load window. Such a JAL
+    # is call-edge evidence for whichever image is resident when it executes,
+    # and several images share a window, so for THIS image it is only a
+    # candidate. It is admitted in exactly one provable shape: a head the
+    # prologue scan found a few words late. PsyQ schedules loads above the
+    # `addiu sp` prologue (WE2002 GAME.BIN 0x80083E98 -> root 0x80083EA0), so
+    # the call lands on straight-line words that end at an existing root and
+    # that no walk owns. Rooting there caps nothing (the next root is that
+    # existing one) and splits no host; anything else is a sibling's entry
+    # (or a data word that decodes as JAL) and is ignored -- rooting it would
+    # cap whichever walk later reaches it.
+    resident_roots = set()
+    root_starts = {a for a in pre_roots if region(a)}
+    for addr in sorted(resident_call_entries):
+        if (not region(addr) or addr in included or addr in root_starts or
+                addr in pre_walk_visited or impossible_entry_start(addr) or
+                (producer_ranges and capture_producer_for(addr) is None)):
+            continue
+        head = addr
+        for _ in range(RESIDENT_HEAD_MAX_WORDS):
+            word = _word_at(data, load_addr, head)
+            if (word is None or not _is_valid_mips_word(word) or
+                    _is_control_flow(word) or head in pre_walk_visited or
+                    (producer_ranges and
+                     capture_producer_for(head) != capture_producer_for(addr))):
+                head = None
+                break
+            head += 4
+            if head in root_starts:
+                break
+        else:
+            head = None
+        if head is not None and head in root_starts:
+            include(addr, 'STATIC_DISCOVERY_ROOT')
+            resident_roots.add(addr)
 
     legacy_seed_mode = bool(legacy_seeds) and not cap.get('schema')
     if legacy_seed_mode:
@@ -2324,6 +2369,7 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         'excluded_counts': excluded_counts,
         'producer_ranges': producer_ranges,
         'static_alias_ranges': static_alias_ranges,
+        'resident_call_roots': resident_roots,
         # Every strong walk root is an exact-entry demand. These roots come from
         # decoder/control-flow, callable-boundary, explicit TOML, or dispatch
         # proof rather than an arbitrary observed PC. If a shared-region build

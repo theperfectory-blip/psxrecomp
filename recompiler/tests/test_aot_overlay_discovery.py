@@ -375,6 +375,68 @@ def check_split_base_jump_table_discovery():
         assert resolve(broken) == set(), name
 
 
+def check_resident_call_entries():
+    # A JAL from the resident boot EXE into a shared load window is only a
+    # candidate per image. It roots exactly a head the prologue scan found
+    # late (PsyQ scheduled the index load above `addiu sp`, as WE2002 GAME.BIN
+    # 0x80083E98); a host interior, a sibling's garbage, a head that is not
+    # straight-line or that sits too far above the root is ignored.
+    data = bytearray(0x200)
+    for offset in range(0xB0, 0x134, 4):
+        put(data, offset, 0x00851021)  # addu v0,a0,a1
+    for offset, word in (
+        (0x30, 0x80137C08), (0x34, 0x80137C08),  # table words before it
+        (0x38, 0x3C038007),  # lui v1,0x8007 (scheduled above the prologue)
+        (0x3C, 0x90635784),  # lbu v1,0x5784(v1)
+        (0x40, 0x27BDFFE8),  # addiu sp,sp,-24
+        (0x44, 0xAFBF0010),  # sw ra,16(sp)
+        (0x48, 0x8FBF0010),  # lw ra,16(sp)
+        (0x4C, 0x27BD0018),  # addiu sp,sp,24
+        (0x50, 0x03E00008),  # jr ra
+        (0x80, 0x27BDFFE8),
+        (0x84, 0xAFBF0010),
+        (0x88, 0x00851021),  # addu v0,a0,a1 (interior of the 0x80 host)
+        (0x8C, 0x8FBF0010),
+        (0x90, 0x27BD0018),
+        (0x94, 0x03E00008),
+        (0x100, 0xFFFFFFFF),  # a sibling's entry lands on data here
+        (0x120, 0x10000002),  # b +8: a transfer above the next root
+        (0x124, 0x00000000),
+        (0x128, 0x27BDFFE8),  # root 0x128
+        (0x12C, 0x03E00008),
+        (0x134, 0x27BDFFE8),  # root 0x134 behind 0x80 bytes of straight line
+        (0x138, 0x03E00008),
+    ):
+        put(data, offset, word)
+    head, interior, garbage = LOAD + 0x38, LOAD + 0x88, LOAD + 0x100
+    branchy, far = LOAD + 0x120, LOAD + 0xB4
+    roots = [f'0x{LOAD + off:08X}' for off in (0x40, 0x80, 0x128, 0x134)]
+    cap = {
+        'schema': 'psxrecomp overlay capture v2',
+        'function_entry_pcs': roots,
+        'dispatch_entry_pcs': roots,
+        'producer_ranges': [{
+            'start': f'0x{LOAD:08X}',
+            'end': f'0x{LOAD + len(data):08X}',
+        }],
+    }
+    seeds, audit = MOD.classify_overlay_seeds(
+        cap, bytes(data), LOAD, len(data), 0, {})
+    assert head not in audit['included_reasons']
+    cap['resident_call_entry_pcs'] = [
+        f'0x{addr:08X}' for addr in
+        (head, interior, garbage, branchy, far, LOAD + 0x1000)]
+    seeds, audit = MOD.classify_overlay_seeds(
+        cap, bytes(data), LOAD, len(data), 0, {})
+    reasons = audit['included_reasons']
+    assert reasons[head] == 'STATIC_DISCOVERY_ROOT'
+    assert audit['resident_call_roots'] == {head}
+    for addr in (interior, garbage, branchy, far, LOAD + 0x1000):
+        assert addr not in reasons, hex(addr)
+    assert f'call_root 0x{interior:08X}' not in seeds
+    assert reasons[LOAD + 0x40] != 'DISPATCH_INTERIOR'
+
+
 def check_composite_call_boundaries():
     data = bytearray(0x100)
     cross_target = LOAD + 0x50
@@ -3998,6 +4060,7 @@ def main():
     check_bounded_jump_table_discovery()
     check_scheduled_jump_table_discovery()
     check_split_base_jump_table_discovery()
+    check_resident_call_entries()
     check_static_discovery_provenance()
     check_static_dispatch_provenance()
     check_owned_direct_call_is_interior()

@@ -644,8 +644,24 @@ def mod_package_views(profile, disc, project_root):
     return views
 
 
-def prepare(profile, disc, records, output, views=None):
+def resident_call_targets(disc, boot_exe):
+    """Direct-call targets in the boot EXE, read from the verified disc.
+
+    The boot EXE stays resident under every overlay, so a JAL from it into a
+    load window is call-edge evidence for whichever image occupies the window.
+    It is offered to each matching recipe as a candidate only; the classifier
+    decides per image (alias inside a walked CFG, root only on CFG proof).
+    """
+    if not boot_exe or boot_exe.upper() not in disc.files:
+        return set()
+    body = disc.read(boot_exe)
+    require(body[:8] == b'PS-X EXE', f'{boot_exe}: missing PS-X EXE header')
+    return set(extractor.jal_targets(body[2048:]))
+
+
+def prepare(profile, disc, records, output, views=None, boot_exe=None):
     verify_evidence(disc, profile.get('checks', []), views)
+    resident_calls = resident_call_targets(disc, boot_exe)
     sources = positioned_sources(disc, profile['images'], views, main_ram_bytes(profile))
     bios = extractor.bios_resident_records() if profile.get('bios_resident') else []
     for record in records:
@@ -720,6 +736,10 @@ def prepare(profile, disc, records, output, views=None):
         covered.update(names)
         record['guard_bytes'] = 0
         record['producer_ranges'] = [dict(start=hex(lo), end=hex(hi)) for lo, hi in bounds]
+        if record.get('producer') != 'bios_resident_manifest':
+            calls = sorted(pc for pc in resident_calls if any(lo <= pc < hi for lo, hi in bounds))
+            if calls:
+                record['resident_call_entry_pcs'] = [hex(pc) for pc in calls]
         if profile.get('strict_bounds'):
             record['strict_producer_ranges'] = True
         data = base64.b64decode(record['bytes_b64'], validate=True)
@@ -794,7 +814,7 @@ def extract(profile_path, game_toml, recompiler, output, cue=None, disc=None, pr
         raise subprocess.CalledProcessError(result.returncode, command)
     views = mod_package_views(profile, disc, game_toml.parent)
     return prepare(profile, disc, json.loads((output / 'generic.json').read_text(encoding='utf-8-sig')),
-                   output, views)
+                   output, views, boot_exe=Path(str(config['game'].get('exe', ''))).name)
 
 
 def audit(game_toml, recompiler, cache, inventory, output, static_dispatch=None, flavor=0):

@@ -866,17 +866,28 @@ bool resolve_exact_bounded_jump_table(
 
     // The address add and index scale must be the two instructions immediately
     // before the load. This deliberately excludes raw-window coincidences.
+    // The one exception is the PsyQ %hi/%lo split base
+    // `sll; lui base,%hi; addu address,base,scaled; lw target,%lo(address)`,
+    // whose LUI sits exactly between them and defines the ADDU's base operand.
     uint32_t addu_pc = lw_pc - 4u;
-    uint32_t sll_pc = addu_pc - 4u;
     auto addu_word = read(addu_pc);
-    auto sll_word = read(sll_pc);
-    if (!addu_word.has_value() || !sll_word.has_value()) return false;
+    if (!addu_word.has_value() || addu_pc < entry + 4u) return false;
     uint32_t addu_op = (*addu_word >> 26) & 0x3Fu;
     uint32_t addu_rs = (*addu_word >> 21) & 0x1Fu;
     uint32_t addu_rt = (*addu_word >> 16) & 0x1Fu;
     uint32_t addu_rd = (*addu_word >> 11) & 0x1Fu;
     uint32_t addu_shamt = (*addu_word >> 6) & 0x1Fu;
     uint32_t addu_fn = *addu_word & 0x3Fu;
+    auto split_word = read(addu_pc - 4u);
+    if (!split_word.has_value()) return false;
+    uint32_t split_reg = (*split_word >> 16) & 0x1Fu;
+    bool split_base = (*split_word >> 26) == 0x0Fu &&
+                      ((*split_word >> 21) & 0x1Fu) == 0u && split_reg != 0u &&
+                      (split_reg == addu_rs || split_reg == addu_rt);
+    uint32_t sll_pc = addu_pc - (split_base ? 8u : 4u);
+    if (sll_pc < entry) return false;
+    auto sll_word = read(sll_pc);
+    if (!sll_word.has_value()) return false;
     uint32_t sll_op = (*sll_word >> 26) & 0x3Fu;
     uint32_t sll_rs = (*sll_word >> 21) & 0x1Fu;
     uint32_t index_reg = (*sll_word >> 16) & 0x1Fu;
@@ -892,19 +903,34 @@ bool resolve_exact_bounded_jump_table(
     }
     uint32_t base_reg = scaled_reg == addu_rs ? addu_rt : addu_rs;
     if (base_reg == 0u || base_reg == scaled_reg ||
+        (split_base && split_reg != base_reg) ||
         in_delay_slot(addu_pc)) {
         return false;
     }
 
     // Exact guards: sltiu; beq; nop; sll, or sltiu; beq; lui; addiu; sll.
     // The latter schedules the table's LUI in the bounds branch's delay slot.
-    // Keep both forms in parity with the Python capture verifier.
+    // The split base (`sltiu; beq; <work>; sll; lui`) defines the base after
+    // SLL, so the guard's delay slot may hold any non-transfer that leaves the
+    // index intact. Keep all forms in parity with the Python capture verifier.
     if (sll_pc < entry + 12u) return false;
     uint32_t guard_pc = sll_pc - 8u;
     uint32_t bound_pc = sll_pc - 12u;
     auto before_scale = read(sll_pc - 4u);
     if (!before_scale.has_value()) return false;
-    bool scheduled_base = *before_scale != 0u;
+    bool scheduled_base = *before_scale != 0u && !split_base;
+    if (split_base) {
+        // R3000 JR would see the old target register without this load delay.
+        if (lw_pc != jr_pc - 8u) return false;
+        if (!exact_is_valid_mips_word(*before_scale) ||
+            is_control(sll_pc - 4u, *before_scale) ||
+            exact_instruction_writes_gpr(*before_scale, index_reg)) {
+            return false;
+        }
+    }
+    // With the base defined inside the guarded suffix, every edge into
+    // (SLTIU, JR] would skip either the bound or the base: protect it all.
+    bool strict_suffix = scheduled_base || split_base;
     if (scheduled_base) {
         // R3000 JR would see the old target register without this load delay.
         if (lw_pc != jr_pc - 8u) return false;
@@ -951,7 +977,7 @@ bool resolve_exact_bounded_jump_table(
     if ((guard_target & 3u) != 0u || guard_target < entry ||
         guard_target >= hard_cap ||
         (guard_target >= sll_pc && guard_target < jr_pc + 8u) ||
-        (scheduled_base && guard_target > bound_pc && guard_target < jr_pc + 8u)) {
+        (strict_suffix && guard_target > bound_pc && guard_target < jr_pc + 8u)) {
         return false;
     }
 
@@ -1000,6 +1026,8 @@ bool resolve_exact_bounded_jump_table(
         }
     }
     if (scheduled_base && (lui_pc != guard_pc + 4u || low_pc != sll_pc - 4u))
+        return false;
+    if (split_base && (lui_pc != sll_pc + 4u || low_pc != 0u))
         return false;
     if (lui_pc == 0u || (in_delay_slot(lui_pc) && !scheduled_base) ||
         (low_pc != 0u && in_delay_slot(low_pc)) ||
@@ -1053,7 +1081,7 @@ bool resolve_exact_bounded_jump_table(
         uint32_t runtime_target = *target_word;
         uint32_t image_target = mapped(runtime_target);
         if (image_target < entry || image_target >= hard_cap ||
-            (scheduled_base && image_target > bound_pc && image_target < jr_pc + 8u) ||
+            (strict_suffix && image_target > bound_pc && image_target < jr_pc + 8u) ||
             image_target < producer_lo || image_target >= producer_hi ||
             (image_target & 3u) != 0u) {
             return false;
@@ -1117,7 +1145,7 @@ bool resolve_exact_bounded_jump_table(
             break;
         }
     }
-    uint32_t protected_pc = scheduled_base ? bound_pc : lui_pc;
+    uint32_t protected_pc = strict_suffix ? bound_pc : lui_pc;
     for (uint32_t source = entry; source < hard_cap; source += 4u) {
         auto word = read(source);
         if (!word.has_value()) return false;
@@ -1127,7 +1155,7 @@ bool resolve_exact_bounded_jump_table(
                       cf.kind == ExactCfKind::Jal;
         if (direct && cf.target > protected_pc && cf.target <= jr_pc &&
             (source < protected_pc || source > jr_pc) &&
-            (scheduled_base || !case_reachable.count(source))) {
+            (strict_suffix || !case_reachable.count(source))) {
             return false;
         }
     }

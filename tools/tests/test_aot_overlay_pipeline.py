@@ -531,6 +531,20 @@ class AotMethodsTest(unittest.TestCase):
                     pipeline.prepare(dict(images=[spec], expected_records=1, strict_bounds=strict),
                                      FakeDisc({'CODE': body}), [dict(record)], Path(directory))
 
+    def test_resident_call_targets_come_from_the_verified_boot_exe(self):
+        # Boot-EXE JALs are offered to overlay recipes as candidates; they are
+        # read from the disc's own EXE, never from a project-side copy.
+        jal = lambda target: 0x0C000000 | ((target >> 2) & 0x03FFFFFF)
+        header = b'PS-X EXE' + bytes(2040)
+        text = struct.pack('<4I', jal(0x80083E98), 0, jal(0x80010100), 0)
+        disc = FakeDisc({'SLPM_870.56': header + text})
+        self.assertEqual(pipeline.resident_call_targets(disc, 'SLPM_870.56'),
+                         {0x80083E98, 0x80010100})
+        self.assertEqual(pipeline.resident_call_targets(disc, ''), set())
+        self.assertEqual(pipeline.resident_call_targets(disc, 'OTRO.EXE'), set())
+        with self.assertRaises(pipeline.ProfileError):
+            pipeline.resident_call_targets(FakeDisc({'X.EXE': bytes(2064)}), 'X.EXE')
+
     def test_dispatch_entry_aliases_its_host_without_splitting_it(self):
         # A resume PC inside a framed function (an exception return lands on
         # any instruction). It must stay an alias of the whole host: as a walk
