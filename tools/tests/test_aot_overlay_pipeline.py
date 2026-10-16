@@ -545,6 +545,24 @@ class AotMethodsTest(unittest.TestCase):
         with self.assertRaises(pipeline.ProfileError):
             pipeline.resident_call_targets(FakeDisc({'X.EXE': bytes(2064)}), 'X.EXE')
 
+    def test_coresident_call_targets_come_only_from_disjoint_images(self):
+        # A JAL from another overlay is call-edge evidence only if that overlay
+        # can be in RAM with the target window (disjoint spans), and only from
+        # its native-eligible bytes (a verified fallback interval is data).
+        jal = lambda target: 0x0C000000 | ((target >> 2) & 0x03FFFFFF)
+        caller_body = struct.pack('<4I', jal(0x800FEA88), 0, jal(0x80200000), 0)
+        caller = dict(base=0x80096000, body=caller_body, spec={})
+        rival = dict(base=0x800FC000, body=struct.pack('<2I', jal(0x800FC100), 0), spec={})
+        data_tail = struct.pack('<2I', jal(0x800FC200), 0)
+        tailed = dict(base=0x80140000, body=struct.pack('<2I', jal(0x800FC300), 0) + data_tail,
+                      spec=dict(excluded_ranges=[dict(start=0x80140008, end=0x80140010,
+                                reason='Data words', sha256=hashlib.sha256(data_tail).hexdigest())]))
+        bounds = [(0x800FC000, 0x80100000)]
+        self.assertEqual(pipeline.coresident_call_targets([caller, rival, tailed], bounds),
+                         {0x800FEA88, 0x800FC300})
+        self.assertEqual(pipeline.coresident_call_targets([caller], [(0x80096000, 0x800FF000)]),
+                         set())
+
     def test_dispatch_entry_aliases_its_host_without_splitting_it(self):
         # A resume PC inside a framed function (an exception return lands on
         # any instruction). It must stay an alias of the whole host: as a walk

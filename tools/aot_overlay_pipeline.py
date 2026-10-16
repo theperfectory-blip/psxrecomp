@@ -659,6 +659,25 @@ def resident_call_targets(disc, boot_exe):
     return set(extractor.jal_targets(body[2048:]))
 
 
+def coresident_call_targets(sources, bounds):
+    """Direct-call targets from configured images that can be resident with `bounds`.
+
+    An image whose load span overlaps the recipe's bounds cannot occupy RAM at
+    the same time (it would overwrite the recipe), so only disjoint images are
+    possible callers; their JALs into the window are the same kind of
+    call-edge evidence as the boot EXE's (WE2002 SELECT.BIN 0x80096230 calls
+    SELECT4.BIN 0x800FEA88). Verified fallback intervals are data, not callers.
+    """
+    targets = set()
+    for source in sources:
+        lo, hi = source['base'], source['base'] + len(source['body'])
+        if any(lo < end and start < hi for start, end in bounds):
+            continue
+        for start, end in eligible_ranges(source, lo, hi):
+            targets |= extractor.jal_targets(source['body'][start-lo:end-lo])
+    return {pc for pc in targets if any(lo <= pc < hi for lo, hi in bounds)}
+
+
 def prepare(profile, disc, records, output, views=None, boot_exe=None):
     verify_evidence(disc, profile.get('checks', []), views)
     resident_calls = resident_call_targets(disc, boot_exe)
@@ -737,7 +756,8 @@ def prepare(profile, disc, records, output, views=None, boot_exe=None):
         record['guard_bytes'] = 0
         record['producer_ranges'] = [dict(start=hex(lo), end=hex(hi)) for lo, hi in bounds]
         if record.get('producer') != 'bios_resident_manifest':
-            calls = sorted(pc for pc in resident_calls if any(lo <= pc < hi for lo, hi in bounds))
+            calls = sorted({pc for pc in resident_calls if any(lo <= pc < hi for lo, hi in bounds)} |
+                           coresident_call_targets(sources, bounds))
             if calls:
                 record['resident_call_entry_pcs'] = [hex(pc) for pc in calls]
         if profile.get('strict_bounds'):
