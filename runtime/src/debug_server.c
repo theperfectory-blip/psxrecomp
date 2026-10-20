@@ -159,11 +159,20 @@ static volatile int s_fmv_quiet = 0;
 void debug_server_set_fmv_quiet(int quiet)
 {
     static int enabled = -1;
+    static int always = -1;
     if (enabled < 0) {
         const char *env = getenv("PSX_DEBUG_FMV_QUIET");
         enabled = (!env || env[0] != '0') ? 1 : 0;
     }
-    s_fmv_quiet = enabled && quiet;
+    /* PSX_DEBUG_ALWAYS_QUIET=1: keep the per-block/per-call/MMIO tracers quiet
+     * all the time (not only during FMV). For playtesting a debug build at full
+     * speed while the TCP server (RAM, savestates, input, screenshots) stays
+     * available. Interpreter accounting is unaffected; tracer rings stay empty. */
+    if (always < 0) {
+        const char *env = getenv("PSX_DEBUG_ALWAYS_QUIET");
+        always = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    s_fmv_quiet = always || (enabled && quiet);
 }
 
 int debug_server_fmv_quiet(void)
