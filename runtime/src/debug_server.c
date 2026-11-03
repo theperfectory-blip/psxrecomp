@@ -2682,6 +2682,139 @@ static inline void pc_probe_observe(uint32_t block_leader_phys)
     }
 }
 
+/* ---- retprobe: per-call return capture (default-off) ----
+ * Arm via TCP `retprobe_arm` {"pcs":"0xA,0xB","ram":"0xA,0xB","n":N}. pcs are
+ * return addresses (jal+8); each hit of one records frame, v0, a0-a3 and the
+ * 32-bit words at each ram address. Read back with `retprobe_dump`.
+ * Disarmed = one branch. */
+#define RETPROBE_MAX_PCS  64
+#define RETPROBE_MAX_RAM   8
+#define RETPROBE_CAP   4096
+typedef struct {
+    uint64_t seq;
+    uint32_t pc, frame, v0, a0, a1, a2, a3;
+    uint32_t ram[RETPROBE_MAX_RAM];
+} RetProbeRec;
+static volatile int s_retprobe_armed = 0;
+static int          s_retprobe_npcs = 0;
+static int          s_retprobe_nram = 0;
+static uint32_t     s_retprobe_pc[RETPROBE_MAX_PCS];
+static uint32_t     s_retprobe_ram[RETPROBE_MAX_RAM];
+static uint32_t     s_retprobe_ramrel[RETPROBE_MAX_RAM];  /* offsets from a0 (entity) */
+static int          s_retprobe_nramrel = 0;
+static RetProbeRec  s_retprobe_ring[RETPROBE_CAP];
+static uint64_t     s_retprobe_seq = 0;
+static uint64_t     s_retprobe_max = RETPROBE_CAP;
+
+static inline void retprobe_observe(uint32_t block_leader_phys)
+{
+    if (!s_retprobe_armed) return;
+    extern CPUState *debug_cpu_ptr;
+    CPUState *cpu = debug_cpu_ptr;
+    if (!cpu) return;
+    for (int i = 0; i < s_retprobe_npcs; i++) {
+        if (s_retprobe_pc[i] != block_leader_phys) continue;
+        if (s_retprobe_seq >= s_retprobe_max) { s_retprobe_armed = 0; return; }
+        RetProbeRec *r = &s_retprobe_ring[s_retprobe_seq % RETPROBE_CAP];
+        r->seq   = s_retprobe_seq++;
+        r->pc    = block_leader_phys;
+        r->frame = (uint32_t)s_frame_count;
+        r->v0    = cpu->gpr[2];
+        r->a0    = cpu->gpr[4];
+        r->a1    = cpu->gpr[5];
+        r->a2    = cpu->gpr[6];
+        r->a3    = cpu->gpr[7];
+        for (int k = 0; k < RETPROBE_MAX_RAM; k++) r->ram[k] = 0u;
+        for (int k = 0; k < s_retprobe_nram; k++)
+            r->ram[k] = psx_read_word(s_retprobe_ram[k]);
+        for (int k = 0; k < s_retprobe_nramrel; k++)
+            r->ram[s_retprobe_nram + k] =
+                psx_read_word((cpu->gpr[4] + s_retprobe_ramrel[k]) & 0x1FFFFFFFu);
+        return;
+    }
+}
+
+/* ---- fnprobe: call/return pairs for a set of functions (default-off) ----
+ * {"cmd":"fnprobe_arm","fns":"0xA,0xB","ram":"..","ramrel":"..","n":N}. At each
+ * entry of a listed function it keeps $ra and $a0-$a3; when control reaches that
+ * $ra it records fn, args, $v0 and the RAM words (abs, and a0-relative at entry).
+ * {"cmd":"fnprobe_dump","since":S,"count":C} reads records,
+ * {"cmd":"fnprobe_counts"} per-function entry counts, {"cmd":"fnprobe_disarm"}.
+ * Disarmed = one branch. */
+#define FNPROBE_MAX_FNS  64
+#define FNPROBE_PENDING  1024
+#define FNPROBE_CAP      8192
+#define FNPROBE_PHYS_WORDS (0x200000u >> 2)
+typedef struct {
+    uint64_t seq;
+    uint32_t fn, ret, frame, v0, a0, a1, a2, a3;
+    uint32_t ram[RETPROBE_MAX_RAM];
+} FnProbeRec;
+typedef struct {
+    uint32_t fi, ra, a0, a1, a2, a3, frame;
+} FnProbePend;
+static volatile int s_fnp_armed = 0;
+static int          s_fnp_nfns = 0;
+static uint32_t     s_fnp_fn[FNPROBE_MAX_FNS];
+static uint32_t     s_fnp_counts[FNPROBE_MAX_FNS];
+static int          s_fnp_nram = 0, s_fnp_nramrel = 0;
+static uint32_t     s_fnp_ram[RETPROBE_MAX_RAM], s_fnp_ramrel[RETPROBE_MAX_RAM];
+static uint64_t     s_fnp_seq = 0, s_fnp_max = FNPROBE_CAP;
+static int          s_fnp_npend = 0;
+static FnProbePend  s_fnp_pend[FNPROBE_PENDING];
+static uint8_t      s_fnp_entry_mark[FNPROBE_PHYS_WORDS];
+static uint16_t     s_fnp_ra_mark[FNPROBE_PHYS_WORDS];
+static FnProbeRec   s_fnp_ring[FNPROBE_CAP];
+
+static inline void fnprobe_observe(uint32_t phys)
+{
+    if (!s_fnp_armed || phys >= 0x200000u) return;
+    extern CPUState *debug_cpu_ptr;
+    CPUState *cpu = debug_cpu_ptr;
+    if (!cpu) return;
+    uint32_t w = phys >> 2;
+    if (s_fnp_ra_mark[w]) {                       /* a pending call returns here */
+        for (int i = s_fnp_npend - 1; i >= 0; i--) {
+            if (s_fnp_pend[i].ra != phys) continue;
+            FnProbePend p = s_fnp_pend[i];
+            s_fnp_pend[i] = s_fnp_pend[--s_fnp_npend];
+            s_fnp_ra_mark[w]--;
+            if (s_fnp_seq < s_fnp_max) {
+                FnProbeRec *r = &s_fnp_ring[s_fnp_seq % FNPROBE_CAP];
+                r->seq   = s_fnp_seq++;
+                r->fn    = s_fnp_fn[p.fi];
+                r->ret   = phys;
+                r->frame = p.frame;
+                r->v0    = cpu->gpr[2];
+                r->a0 = p.a0; r->a1 = p.a1; r->a2 = p.a2; r->a3 = p.a3;
+                for (int k = 0; k < RETPROBE_MAX_RAM; k++) r->ram[k] = 0u;
+                for (int k = 0; k < s_fnp_nram; k++)
+                    r->ram[k] = psx_read_word(s_fnp_ram[k]);
+                for (int k = 0; k < s_fnp_nramrel; k++)
+                    r->ram[s_fnp_nram + k] =
+                        psx_read_word((p.a0 + s_fnp_ramrel[k]) & 0x1FFFFFFFu);
+            }
+            break;
+        }
+    }
+    if (s_fnp_entry_mark[w]) {                    /* a listed function is entered */
+        for (int i = 0; i < s_fnp_nfns; i++) {
+            if (s_fnp_fn[i] != phys) continue;
+            s_fnp_counts[i]++;
+            uint32_t ra = cpu->gpr[31] & 0x1FFFFFFFu;
+            if (s_fnp_npend < FNPROBE_PENDING && ra < 0x200000u) {
+                FnProbePend *p = &s_fnp_pend[s_fnp_npend++];
+                p->fi = (uint32_t)i; p->ra = ra;
+                p->a0 = cpu->gpr[4]; p->a1 = cpu->gpr[5];
+                p->a2 = cpu->gpr[6]; p->a3 = cpu->gpr[7];
+                p->frame = (uint32_t)s_frame_count;
+                s_fnp_ra_mark[ra >> 2]++;
+            }
+            break;
+        }
+    }
+}
+
 /* Exported per-basic-block-leader cycle observer. Emitted by the recompiler at
  * EVERY compiled block leader (under #ifndef PSX_NO_DEBUG_TOOLS, so prod builds
  * emit nothing — zero overhead) so native's cycle observation matches Beetle's
@@ -2767,6 +2900,8 @@ void debug_server_cyc_observe(uint32_t block_leader_phys) {
     }
     cyc_watch_observe(phys);
     pc_probe_observe(phys);
+    retprobe_observe(phys);
+    fnprobe_observe(phys);
     /* #2 lockstep comparator: per-basic-block compiled-vs-interp check. Self-gates
      * on the armed frame window; ~free (one branch) when disarmed. */
     { extern void ls_at_leader(uint32_t, CPUState*); extern CPUState *debug_cpu_ptr;
@@ -11744,6 +11879,185 @@ static void handle_pc_probe_clear(int id, const char *json)
     send_ok(id);
 }
 
+/* Comma-separated hex list -> masked phys addresses. Returns the count. */
+static int retprobe_parse_list(const char *s, uint32_t *out, int cap)
+{
+    int n = 0;
+    while (*s && n < cap) {
+        while (*s == ' ' || *s == ',') s++;
+        if (!*s) break;
+        char *end = NULL;
+        uint32_t v = (uint32_t)strtoul(s, &end, 0);
+        if (end == s) break;
+        out[n++] = v & 0x1FFFFFFFu;
+        s = end;
+    }
+    return n;
+}
+
+static void handle_retprobe_arm(int id, const char *json)
+{
+    char pcs[1024], ram[256];
+    s_retprobe_armed = 0;
+    s_retprobe_seq = 0;
+    s_retprobe_npcs = 0;
+    s_retprobe_nram = 0;
+    if (json_get_str(json, "pcs", pcs, sizeof(pcs)))
+        s_retprobe_npcs = retprobe_parse_list(pcs, s_retprobe_pc, RETPROBE_MAX_PCS);
+    if (json_get_str(json, "ram", ram, sizeof(ram)))
+        s_retprobe_nram = retprobe_parse_list(ram, s_retprobe_ram, RETPROBE_MAX_RAM);
+    char ramrel[256];
+    s_retprobe_nramrel = 0;
+    if (json_get_str(json, "ramrel", ramrel, sizeof(ramrel)))
+        s_retprobe_nramrel = retprobe_parse_list(ramrel, s_retprobe_ramrel, RETPROBE_MAX_RAM);
+    if (s_retprobe_nram + s_retprobe_nramrel > RETPROBE_MAX_RAM)
+        s_retprobe_nramrel = RETPROBE_MAX_RAM - s_retprobe_nram;
+    if (s_retprobe_npcs <= 0) { send_err(id, "retprobe_arm needs pcs=0xA,0xB,..."); return; }
+    int n = json_get_int(json, "n", RETPROBE_CAP);
+    if (n < 1) n = 1;
+    if (n > RETPROBE_CAP) n = RETPROBE_CAP;
+    s_retprobe_max = (uint64_t)n;
+    s_retprobe_armed = 1;
+    send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"npcs\":%d,\"nram\":%d,\"max\":%d}",
+             id, s_retprobe_npcs, s_retprobe_nram, n);
+}
+
+static void handle_retprobe_disarm(int id, const char *json)
+{
+    (void)json;
+    s_retprobe_armed = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"armed\":0,\"total\":%llu}",
+             id, (unsigned long long)s_retprobe_seq);
+}
+
+static void handle_fnprobe_arm(int id, const char *json)
+{
+    char fns[1024], ram[256], ramrel[256];
+    s_fnp_armed = 0;
+    s_fnp_seq = 0;
+    s_fnp_npend = 0;
+    memset(s_fnp_entry_mark, 0, sizeof(s_fnp_entry_mark));
+    memset(s_fnp_ra_mark, 0, sizeof(s_fnp_ra_mark));
+    s_fnp_nfns = 0;
+    if (json_get_str(json, "fns", fns, sizeof(fns))) {
+        uint32_t tmp[FNPROBE_MAX_FNS];
+        int n = retprobe_parse_list(fns, tmp, FNPROBE_MAX_FNS);
+        for (int i = 0; i < n; i++) {
+            s_fnp_fn[i] = tmp[i];
+            s_fnp_counts[i] = 0;
+            if (tmp[i] < 0x200000u) s_fnp_entry_mark[tmp[i] >> 2] = 1;
+        }
+        s_fnp_nfns = n;
+    }
+    s_fnp_nram = 0;
+    s_fnp_nramrel = 0;
+    if (json_get_str(json, "ram", ram, sizeof(ram)))
+        s_fnp_nram = retprobe_parse_list(ram, s_fnp_ram, RETPROBE_MAX_RAM);
+    if (json_get_str(json, "ramrel", ramrel, sizeof(ramrel)))
+        s_fnp_nramrel = retprobe_parse_list(ramrel, s_fnp_ramrel, RETPROBE_MAX_RAM);
+    if (s_fnp_nram + s_fnp_nramrel > RETPROBE_MAX_RAM)
+        s_fnp_nramrel = RETPROBE_MAX_RAM - s_fnp_nram;
+    if (s_fnp_nfns <= 0) { send_err(id, "fnprobe_arm needs fns=0xA,0xB,..."); return; }
+    int n = json_get_int(json, "n", FNPROBE_CAP);
+    if (n < 1) n = 1;
+    if (n > FNPROBE_CAP) n = FNPROBE_CAP;
+    s_fnp_max = (uint64_t)n;
+    s_fnp_armed = 1;
+    send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"nfns\":%d,\"nram\":%d,\"nramrel\":%d,\"max\":%d}",
+             id, s_fnp_nfns, s_fnp_nram, s_fnp_nramrel, n);
+}
+
+static void handle_fnprobe_disarm(int id, const char *json)
+{
+    (void)json;
+    s_fnp_armed = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"armed\":0,\"total\":%llu}",
+             id, (unsigned long long)s_fnp_seq);
+}
+
+static void handle_fnprobe_counts(int id, const char *json)
+{
+    (void)json;
+    char buf[4096];
+    int pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "{\"id\":%d,\"ok\":true,\"armed\":%d,\"total\":%llu,\"pending\":%d,\"counts\":[",
+                    id, s_fnp_armed, (unsigned long long)s_fnp_seq, s_fnp_npend);
+    for (int i = 0; i < s_fnp_nfns; i++)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s{\"fn\":\"0x%08X\",\"n\":%u}",
+                        i ? "," : "", s_fnp_fn[i], s_fnp_counts[i]);
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    debug_server_send_line(buf);
+}
+
+static void handle_fnprobe_dump(int id, const char *json)
+{
+    uint64_t total = s_fnp_seq;
+    uint64_t oldest = total > FNPROBE_CAP ? total - FNPROBE_CAP : 0;
+    uint64_t since = (uint64_t)json_get_int(json, "since", 0);
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 1024) count = 1024;
+    if (since < oldest) since = oldest;
+    size_t BUF_SZ = 512u + (size_t)count * 420u;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"armed\":%d,\"total\":%llu,\"oldest\":%llu,\"entries\":[",
+                    id, s_fnp_armed, (unsigned long long)total, (unsigned long long)oldest);
+    int emitted = 0;
+    for (uint64_t s = since; s < total && emitted < count && pos < BUF_SZ - 420; s++) {
+        FnProbeRec *r = &s_fnp_ring[s % FNPROBE_CAP];
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"fn\":\"0x%08X\",\"ret\":\"0x%08X\",\"frame\":%u,\"v0\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\",\"ram\":[",
+            emitted ? "," : "", (unsigned long long)r->seq, r->fn, r->ret, r->frame, r->v0,
+            r->a0, r->a1, r->a2, r->a3);
+        for (int k = 0; k < s_fnp_nram + s_fnp_nramrel; k++)
+            pos += snprintf(buf + pos, BUF_SZ - pos, "%s\"0x%08X\"", k ? "," : "", r->ram[k]);
+        pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+        emitted++;
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_retprobe_dump(int id, const char *json)
+{
+    uint64_t total = s_retprobe_seq;
+    uint64_t oldest = total > RETPROBE_CAP ? total - RETPROBE_CAP : 0;
+    uint64_t since = (uint64_t)json_get_int(json, "since", 0);
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 1024) count = 1024;
+    if (since < oldest) since = oldest;
+    size_t BUF_SZ = 512u + (size_t)count * 420u;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"armed\":%d,\"total\":%llu,\"oldest\":%llu,\"entries\":[",
+                    id, s_retprobe_armed, (unsigned long long)total, (unsigned long long)oldest);
+    int emitted = 0;
+    for (uint64_t s = since; s < total && emitted < count && pos < BUF_SZ - 420; s++) {
+        RetProbeRec *r = &s_retprobe_ring[s % RETPROBE_CAP];
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"pc\":\"0x%08X\",\"frame\":%u,\"v0\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\",\"ram\":[",
+            emitted ? "," : "", (unsigned long long)r->seq, r->pc, r->frame, r->v0,
+            r->a0, r->a1, r->a2, r->a3);
+        for (int k = 0; k < s_retprobe_nram + s_retprobe_nramrel; k++)
+            pos += snprintf(buf + pos, BUF_SZ - pos, "%s\"0x%08X\"", k ? "," : "", r->ram[k]);
+        pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+        emitted++;
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
 /* Liveness/freeze diagnostic: returns a single snapshot of every counter
  * that distinguishes "stuck in a tight handler loop" from "just slow" or
  * "starved on TCP poll".  Pass {"window":N} (default 256) to also include
@@ -16075,6 +16389,13 @@ static const CmdEntry s_commands[] = {
     { "pc_probe_arm",      handle_pc_probe_arm },
     { "pc_probe_dump",     handle_pc_probe_dump },
     { "pc_probe_clear",    handle_pc_probe_clear },
+    { "retprobe_arm",      handle_retprobe_arm },
+    { "retprobe_dump",     handle_retprobe_dump },
+    { "retprobe_disarm",   handle_retprobe_disarm },
+    { "fnprobe_arm",       handle_fnprobe_arm },
+    { "fnprobe_disarm",    handle_fnprobe_disarm },
+    { "fnprobe_counts",    handle_fnprobe_counts },
+    { "fnprobe_dump",      handle_fnprobe_dump },
     { "mmio_dump",         handle_mmio_dump },
     { "mmio_clear",        handle_mmio_clear },
     { "capture_freeze",    handle_capture_freeze },
