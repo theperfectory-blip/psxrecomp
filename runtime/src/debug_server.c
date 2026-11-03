@@ -2743,13 +2743,36 @@ static inline void retprobe_observe(uint32_t block_leader_phys)
  * Disarmed = one branch. */
 #define FNPROBE_MAX_FNS  64
 #define FNPROBE_PENDING  1024
-#define FNPROBE_CAP      8192
+#define FNPROBE_CAP      32768
 #define FNPROBE_PHYS_WORDS (0x200000u >> 2)
+#define FNPROBE_SNAP_ENT   13
+#define FNPROBE_SNAP_BYTES (24 * FNPROBE_SNAP_ENT)
 typedef struct {
     uint64_t seq;
     uint32_t fn, ret, frame, v0, a0, a1, a2, a3;
     uint32_t ram[RETPROBE_MAX_RAM];
+    uint8_t  snap[FNPROBE_SNAP_BYTES];   /* 24 entidades (balon = 0), si snap=1 */
 } FnProbeRec;
+static int s_fnp_snap = 0;
+/* Foto de las 24 entidades: x,y,z (s16), id, lado, modo, submodo, o383, o388, botones (u8). */
+static void fnprobe_snapshot(uint8_t *out)
+{
+    for (int k = 0; k < 24; k++) {
+        uint32_t b = 0x00075928u + (uint32_t)k * 0x38Cu;
+        uint8_t *o = out + k * FNPROBE_SNAP_ENT;
+        o[0]  = psx_read_byte(b + 2u);  o[1]  = psx_read_byte(b + 3u);
+        o[2]  = psx_read_byte(b + 4u);  o[3]  = psx_read_byte(b + 5u);
+        o[4]  = psx_read_byte(b + 6u);  o[5]  = psx_read_byte(b + 7u);
+        o[6]  = psx_read_byte(b + 0x324u);
+        o[7]  = psx_read_byte(b + 0x32Bu);
+        o[8]  = psx_read_byte(b + 0x327u);
+        o[9]  = psx_read_byte(b + 0x328u);
+        o[10] = psx_read_byte(b + 0x17Fu);
+        o[11] = psx_read_byte(b + 0x184u);
+        o[12] = psx_read_byte(b + 0x36Au);
+    }
+}
+
 typedef struct {
     uint32_t fi, ra, a0, a1, a2, a3, frame;
 } FnProbePend;
@@ -2787,6 +2810,7 @@ static inline void fnprobe_observe(uint32_t phys)
                 r->frame = p.frame;
                 r->v0    = cpu->gpr[2];
                 r->a0 = p.a0; r->a1 = p.a1; r->a2 = p.a2; r->a3 = p.a3;
+                if (s_fnp_snap) fnprobe_snapshot(r->snap);
                 for (int k = 0; k < RETPROBE_MAX_RAM; k++) r->ram[k] = 0u;
                 for (int k = 0; k < s_fnp_nram; k++)
                     r->ram[k] = psx_read_word(s_fnp_ram[k]);
@@ -11957,14 +11981,15 @@ static void handle_fnprobe_arm(int id, const char *json)
         s_fnp_nramrel = retprobe_parse_list(ramrel, s_fnp_ramrel, RETPROBE_MAX_RAM);
     if (s_fnp_nram + s_fnp_nramrel > RETPROBE_MAX_RAM)
         s_fnp_nramrel = RETPROBE_MAX_RAM - s_fnp_nram;
+    s_fnp_snap = json_get_int(json, "snap", 0) != 0;
     if (s_fnp_nfns <= 0) { send_err(id, "fnprobe_arm needs fns=0xA,0xB,..."); return; }
     int n = json_get_int(json, "n", FNPROBE_CAP);
     if (n < 1) n = 1;
     if (n > FNPROBE_CAP) n = FNPROBE_CAP;
     s_fnp_max = (uint64_t)n;
     s_fnp_armed = 1;
-    send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"nfns\":%d,\"nram\":%d,\"nramrel\":%d,\"max\":%d}",
-             id, s_fnp_nfns, s_fnp_nram, s_fnp_nramrel, n);
+    send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"nfns\":%d,\"nram\":%d,\"nramrel\":%d,\"snap\":%d,\"max\":%d}",
+             id, s_fnp_nfns, s_fnp_nram, s_fnp_nramrel, s_fnp_snap, n);
 }
 
 static void handle_fnprobe_disarm(int id, const char *json)
@@ -11999,7 +12024,8 @@ static void handle_fnprobe_dump(int id, const char *json)
     if (count < 1) count = 1;
     if (count > 1024) count = 1024;
     if (since < oldest) since = oldest;
-    size_t BUF_SZ = 512u + (size_t)count * 420u;
+    size_t per = 480u + (s_fnp_snap ? 2u * FNPROBE_SNAP_BYTES + 16u : 0u);
+    size_t BUF_SZ = 512u + (size_t)count * per;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;
@@ -12007,7 +12033,7 @@ static void handle_fnprobe_dump(int id, const char *json)
                     "{\"id\":%d,\"ok\":true,\"armed\":%d,\"total\":%llu,\"oldest\":%llu,\"entries\":[",
                     id, s_fnp_armed, (unsigned long long)total, (unsigned long long)oldest);
     int emitted = 0;
-    for (uint64_t s = since; s < total && emitted < count && pos < BUF_SZ - 420; s++) {
+    for (uint64_t s = since; s < total && emitted < count && pos < BUF_SZ - per; s++) {
         FnProbeRec *r = &s_fnp_ring[s % FNPROBE_CAP];
         pos += snprintf(buf + pos, BUF_SZ - pos,
             "%s{\"seq\":%llu,\"fn\":\"0x%08X\",\"ret\":\"0x%08X\",\"frame\":%u,\"v0\":\"0x%08X\","
@@ -12016,7 +12042,14 @@ static void handle_fnprobe_dump(int id, const char *json)
             r->a0, r->a1, r->a2, r->a3);
         for (int k = 0; k < s_fnp_nram + s_fnp_nramrel; k++)
             pos += snprintf(buf + pos, BUF_SZ - pos, "%s\"0x%08X\"", k ? "," : "", r->ram[k]);
-        pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+        pos += snprintf(buf + pos, BUF_SZ - pos, "]");
+        if (s_fnp_snap) {
+            pos += snprintf(buf + pos, BUF_SZ - pos, ",\"snap\":\"");
+            for (int k = 0; k < FNPROBE_SNAP_BYTES; k++)
+                pos += snprintf(buf + pos, BUF_SZ - pos, "%02x", r->snap[k]);
+            pos += snprintf(buf + pos, BUF_SZ - pos, "\"");
+        }
+        pos += snprintf(buf + pos, BUF_SZ - pos, "}");
         emitted++;
     }
     pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%d}", emitted);
