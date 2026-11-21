@@ -121,6 +121,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_timeline.h"
 #include "crc32.h"
 #include "disc_identity.h"
+#include "volunteer_sampling.h"
 #include "sbi_setup.h"
 #include "disc_path.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
@@ -3955,6 +3956,8 @@ static const char* netplay_start_failure(int nrc, const PsxNetplayConfig& cfg) {
 
 static void shutdown_runtime(void) {
     psx_local_mouse_clear();
+    /* e1n2: disarm fnprobe, save counters and write the samples .zip. */
+    volunteer_sampling_shutdown();
     /* (sljit removed 2026-07-15: overlay_compile_worker_stop joined the
      * off-thread JIT worker here; the worker no longer exists.) */
     psx_netplay_shutdown();
@@ -3981,6 +3984,7 @@ static void shutdown_runtime(void) {
 /* Tear down the game window/GL/audio after a lobby soft-return. Leaves SDL
  * subsystems and the lobby WebSocket intact for the next launcher session. */
 static void teardown_game_session_keep_lobby(void) {
+    volunteer_sampling_shutdown();
     netplay_host_present_restore();
     psx_netplay_shutdown();
     psx_rewind_shutdown();
@@ -8457,6 +8461,8 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
         runtime_perf_section_end(perf_start,
                                  &g_runtime_perf.autocapture_ticks);
     }
+    /* e1n2: volunteer RAM sampling (no-op unless --muestreo/PSX_MUESTREO). */
+    volunteer_sampling_tick();
     {   /* Apply a finished batch compile via the active code provider (gcc:
          * cache rescan on done). */
         uint64_t perf_start = runtime_perf_section_begin();
@@ -15946,6 +15952,7 @@ int main(int argc, char** argv) {
     const char* cli_window_title = nullptr;  /* label windows in a fleet */
     const char* cli_netplay_query = nullptr; /* --netplay-query <request> */
     const char* cli_memcard_dir = nullptr;   /* isolate writable state in a fleet */
+    const char* cli_sampling_dir = nullptr;  /* e1n2: --muestreo <carpeta> */
     std::vector<std::string> cli_path_arg_storage;
     cli_path_arg_storage.reserve((size_t)argc);
     auto is_cli_option = [](const char* arg) {
@@ -15985,6 +15992,7 @@ int main(int argc, char** argv) {
      *   --disc <path>       override the game config disc path
      *   --debug-port <n>    override the TCP debug-server port (multi-instance)
      *   --memcard-dir <path> override card/save/options state (multi-instance)
+     *   --muestreo <path>   e1n2: record RAM samples for stage-2 (off by default)
      *   --renderer <name>   override the renderer: software|opengl|vulkan
      *   --launcher          force the GUI launcher (overrides skip_launcher)
      *   --no-launcher       skip the GUI launcher (boot straight in)
@@ -16014,6 +16022,9 @@ int main(int argc, char** argv) {
             cli_debug_port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--memcard-dir") == 0 && i + 1 < argc) {
             cli_memcard_dir = consume_path_arg(i);
+        } else if (std::strcmp(argv[i], "--muestreo") == 0 && i + 1 < argc) {
+            /* e1n2: volunteer RAM sampling folder (off unless given). */
+            cli_sampling_dir = consume_path_arg(i);
         } else if (std::strcmp(argv[i], "--renderer") == 0 && i + 1 < argc) {
             const char* r = argv[++i];
             if      (std::strcmp(r, "software") == 0) cli_renderer = 0;
@@ -19509,6 +19520,37 @@ session_reboot:
                              "OpenGL retained texture banks; the backend is unavailable\n");
         return 1;
     }
+    /* e1n2: volunteer RAM sampling. Off unless --muestreo <carpeta> or
+     * PSX_MUESTREO=<carpeta>. The disc check reuses the runtime's own
+     * disc_identity (header + SYSTEM.CNF serial), so a wrong disc records
+     * nothing and leaves NO_GRABADO.txt instead. */
+    {
+        const char* muestreo_dir = cli_sampling_dir;
+        if (!muestreo_dir) {
+            if (const char* e = std::getenv("PSX_MUESTREO")) {
+                if (e[0]) muestreo_dir = e;
+            }
+        }
+        if (muestreo_dir && muestreo_dir[0]) {
+            bool disco_ok = false;
+            std::string detalle = "no se pudo leer el disco";
+            if (!disc_path_str.empty()) {
+                const PSXRecompV4::DiscIdentity sid = PSXRecompV4::identify_disc(
+                    disc_path_str, "SLPM-87056", /*expected_crc*/0,
+                    /*has_expected_crc*/false, /*compute_crc*/false);
+                disco_ok = sid.opened && sid.has_header &&
+                           (sid.serial_matches ||
+                            uppercase_ascii(sid.detected_serial) == "SLPM-87056");
+                detalle = sid.detected_serial.empty()
+                              ? (sid.detail.empty() ? "cabecera no reconocida" : sid.detail)
+                              : ("serial detectado: " + sid.detected_serial);
+            }
+            volunteer_sampling_init(
+                muestreo_dir, exe_dir_from_argv(argv[0]).string().c_str(),
+                disco_ok ? 1 : 0, detalle.c_str());
+        }
+    }
+
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
 

@@ -2839,6 +2839,106 @@ static inline void fnprobe_observe(uint32_t phys)
     }
 }
 
+/* ---- Programmatic fnprobe (in-runtime volunteer sampling, e1n2) ----------
+ * The TCP handlers below and the sampling mode share this one arm routine and
+ * the same s_fnp_* state, so nothing is duplicated: disarmed still costs one
+ * branch in fnprobe_observe(). */
+static int fnprobe_arm_core(const uint32_t *fns, int nfns, uint32_t max_recs,
+                            const uint32_t *ram, int nram,
+                            const uint32_t *ramrel, int nramrel, int snap)
+{
+    s_fnp_armed = 0;
+    s_fnp_seq = 0;
+    s_fnp_npend = 0;
+    memset(s_fnp_entry_mark, 0, sizeof(s_fnp_entry_mark));
+    memset(s_fnp_ra_mark, 0, sizeof(s_fnp_ra_mark));
+    s_fnp_nfns = 0;
+    if (nfns < 0) nfns = 0;
+    if (nfns > FNPROBE_MAX_FNS) nfns = FNPROBE_MAX_FNS;
+    for (int i = 0; i < nfns; i++) {
+        s_fnp_fn[i] = fns[i] & 0x1FFFFFFFu;   /* same mask as retprobe_parse_list */
+        s_fnp_counts[i] = 0;
+        if (s_fnp_fn[i] < 0x200000u) s_fnp_entry_mark[s_fnp_fn[i] >> 2] = 1;
+    }
+    s_fnp_nfns = nfns;
+    s_fnp_nram = 0;
+    s_fnp_nramrel = 0;
+    if (ram && nram > 0) {
+        if (nram > RETPROBE_MAX_RAM) nram = RETPROBE_MAX_RAM;
+        for (int i = 0; i < nram; i++) s_fnp_ram[i] = ram[i] & 0x1FFFFFFFu;
+        s_fnp_nram = nram;
+    }
+    if (ramrel && nramrel > 0) {
+        if (nramrel > RETPROBE_MAX_RAM - s_fnp_nram)
+            nramrel = RETPROBE_MAX_RAM - s_fnp_nram;
+        for (int i = 0; i < nramrel; i++) s_fnp_ramrel[i] = ramrel[i] & 0x1FFFFFFFu;
+        s_fnp_nramrel = nramrel;
+    }
+    s_fnp_snap = snap != 0;
+    if (s_fnp_nfns <= 0) return 0;
+    if (max_recs < 1) max_recs = 1;
+    if (max_recs > FNPROBE_CAP) max_recs = FNPROBE_CAP;
+    s_fnp_max = (uint64_t)max_recs;
+    s_fnp_armed = 1;
+    return 1;
+}
+
+int debug_server_fnprobe_start(const uint32_t *fns, int nfns, uint32_t max_recs,
+                               const uint32_t *ram, int nram,
+                               const uint32_t *ramrel, int nramrel, int snap)
+{
+    return fnprobe_arm_core(fns, nfns, max_recs, ram, nram, ramrel, nramrel, snap);
+}
+
+void debug_server_fnprobe_stop(void)
+{
+    s_fnp_armed = 0;
+}
+
+int debug_server_fnprobe_armed(void)
+{
+    return s_fnp_armed ? 1 : 0;
+}
+
+uint64_t debug_server_fnprobe_total(void)
+{
+    return s_fnp_seq;
+}
+
+int debug_server_fnprobe_counts(uint32_t *counts_out, int max_out)
+{
+    int n = s_fnp_nfns;
+    if (n > max_out) n = max_out;
+    for (int i = 0; i < n; i++) {
+        if (counts_out) counts_out[i] = s_fnp_counts[i];
+    }
+    return n;
+}
+
+int debug_server_fnprobe_copy_samples(uint64_t since, PsxFnProbeSample *out,
+                                      int max_out, uint64_t *oldest_out)
+{
+    uint64_t total = s_fnp_seq;
+    uint64_t oldest = total > FNPROBE_CAP ? total - FNPROBE_CAP : 0;
+    if (oldest_out) *oldest_out = oldest;
+    if (since < oldest) since = oldest;
+    int n = 0;
+    for (uint64_t s = since; s < total && n < max_out; s++) {
+        const FnProbeRec *r = &s_fnp_ring[s % FNPROBE_CAP];
+        PsxFnProbeSample *o = &out[n++];
+        o->seq   = r->seq;
+        o->fn    = r->fn;
+        o->ret   = r->ret;
+        o->frame = r->frame;
+        o->v0    = r->v0;
+        o->a0    = r->a0; o->a1 = r->a1; o->a2 = r->a2; o->a3 = r->a3;
+        for (int k = 0; k < PSX_FNPROBE_MAX_RAM; k++)
+            o->ram[k] = k < RETPROBE_MAX_RAM ? r->ram[k] : 0u;
+        memcpy(o->snap, r->snap, PSX_FNPROBE_SNAP_BYTES);
+    }
+    return n;
+}
+
 /* Exported per-basic-block-leader cycle observer. Emitted by the recompiler at
  * EVERY compiled block leader (under #ifndef PSX_NO_DEBUG_TOOLS, so prod builds
  * emit nothing — zero overhead) so native's cycle observation matches Beetle's
@@ -11957,37 +12057,24 @@ static void handle_retprobe_disarm(int id, const char *json)
 static void handle_fnprobe_arm(int id, const char *json)
 {
     char fns[1024], ram[256], ramrel[256];
-    s_fnp_armed = 0;
-    s_fnp_seq = 0;
-    s_fnp_npend = 0;
-    memset(s_fnp_entry_mark, 0, sizeof(s_fnp_entry_mark));
-    memset(s_fnp_ra_mark, 0, sizeof(s_fnp_ra_mark));
-    s_fnp_nfns = 0;
-    if (json_get_str(json, "fns", fns, sizeof(fns))) {
-        uint32_t tmp[FNPROBE_MAX_FNS];
-        int n = retprobe_parse_list(fns, tmp, FNPROBE_MAX_FNS);
-        for (int i = 0; i < n; i++) {
-            s_fnp_fn[i] = tmp[i];
-            s_fnp_counts[i] = 0;
-            if (tmp[i] < 0x200000u) s_fnp_entry_mark[tmp[i] >> 2] = 1;
-        }
-        s_fnp_nfns = n;
-    }
-    s_fnp_nram = 0;
-    s_fnp_nramrel = 0;
+    uint32_t tmp[FNPROBE_MAX_FNS];
+    uint32_t ramv[RETPROBE_MAX_RAM], ramrelv[RETPROBE_MAX_RAM];
+    int nfns = 0, nram = 0, nramrel = 0;
+    if (json_get_str(json, "fns", fns, sizeof(fns)))
+        nfns = retprobe_parse_list(fns, tmp, FNPROBE_MAX_FNS);
     if (json_get_str(json, "ram", ram, sizeof(ram)))
-        s_fnp_nram = retprobe_parse_list(ram, s_fnp_ram, RETPROBE_MAX_RAM);
+        nram = retprobe_parse_list(ram, ramv, RETPROBE_MAX_RAM);
     if (json_get_str(json, "ramrel", ramrel, sizeof(ramrel)))
-        s_fnp_nramrel = retprobe_parse_list(ramrel, s_fnp_ramrel, RETPROBE_MAX_RAM);
-    if (s_fnp_nram + s_fnp_nramrel > RETPROBE_MAX_RAM)
-        s_fnp_nramrel = RETPROBE_MAX_RAM - s_fnp_nram;
-    s_fnp_snap = json_get_int(json, "snap", 0) != 0;
-    if (s_fnp_nfns <= 0) { send_err(id, "fnprobe_arm needs fns=0xA,0xB,..."); return; }
+        nramrel = retprobe_parse_list(ramrel, ramrelv, RETPROBE_MAX_RAM);
     int n = json_get_int(json, "n", FNPROBE_CAP);
     if (n < 1) n = 1;
     if (n > FNPROBE_CAP) n = FNPROBE_CAP;
-    s_fnp_max = (uint64_t)n;
-    s_fnp_armed = 1;
+    int snap = json_get_int(json, "snap", 0) != 0;
+    if (nfns <= 0 || !fnprobe_arm_core(tmp, nfns, (uint32_t)n, ramv, nram,
+                                       ramrelv, nramrel, snap)) {
+        send_err(id, "fnprobe_arm needs fns=0xA,0xB,...");
+        return;
+    }
     send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"nfns\":%d,\"nram\":%d,\"nramrel\":%d,\"snap\":%d,\"max\":%d}",
              id, s_fnp_nfns, s_fnp_nram, s_fnp_nramrel, s_fnp_snap, n);
 }

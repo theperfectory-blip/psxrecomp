@@ -189,6 +189,36 @@ void debug_server_log_thread_event_ex(uint32_t kind, CPUState *cpu,
  * loop can overwrite the trace rings. */
 int debug_server_dirty_break_maybe_pause(uint32_t target, CPUState *cpu);
 
+/* ---- Programmatic fnprobe (in-runtime volunteer sampling, e1n2) ----------
+ * Same ring and arm path as the TCP fnprobe_* commands; used by
+ * volunteer_sampling.c so the .exe can record samples with no client.
+ * Addresses are virtual (0x8...) or physical; both are masked internally.
+ * Call only from the emulation thread (the guest fiber). */
+#define PSX_FNPROBE_MAX_FNS    64
+#define PSX_FNPROBE_MAX_RAM    8
+#define PSX_FNPROBE_SNAP_BYTES (24 * 13)
+
+typedef struct {
+    uint64_t seq;
+    uint32_t fn, ret, frame, v0, a0, a1, a2, a3;
+    uint32_t ram[PSX_FNPROBE_MAX_RAM];
+    uint8_t  snap[PSX_FNPROBE_SNAP_BYTES];
+} PsxFnProbeSample;
+
+/* Arm <= PSX_FNPROBE_MAX_FNS functions. Returns 1 when armed, 0 on bad input. */
+int  debug_server_fnprobe_start(const uint32_t *fns, int nfns, uint32_t max_recs,
+                                const uint32_t *ram, int nram,
+                                const uint32_t *ramrel, int nramrel, int snap);
+void debug_server_fnprobe_stop(void);
+int  debug_server_fnprobe_armed(void);
+uint64_t debug_server_fnprobe_total(void);
+/* Entry counts for the armed functions, in arm order. Returns how many written. */
+int  debug_server_fnprobe_counts(uint32_t *counts_out, int max_out);
+/* Copy retained records from `since` (clamped to the ring). Returns the count
+ * copied; `oldest_out` receives the oldest still-retained sequence number. */
+int  debug_server_fnprobe_copy_samples(uint64_t since, PsxFnProbeSample *out,
+                                       int max_out, uint64_t *oldest_out);
+
 /* ---- Watchpoint notifications ---- */
 
 void debug_server_check_watchpoints(void);
