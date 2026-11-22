@@ -177,10 +177,23 @@ extern void psx_dispatch_call(CPUState* cpu, uint32_t target_addr, uint32_t retu
 extern int g_psx_precise_slice;
 extern int psx_slice_block_impl(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
 void psx_precise_slice_init_from_env(void);
+#if defined(PSX_VOLUNTEER_SAMPLING) && defined(PSX_NO_DEBUG_TOOLS)
+/* e1n4: volunteer sampling hook. Every generated block leader already calls
+ * psx_slice_block() under PSX_ENABLE_BLOCK_CYCLES, so the sampler gets the
+ * same block-leader stream the debug build got from
+ * debug_server_cyc_observe() — without compiling any of the debug tooling.
+ * Disarmed: one load + branch. The flag is the fnprobe arm flag in
+ * debug_server.c (non-static only in this configuration). */
+extern volatile int g_psx_fnprobe_armed;
+extern void debug_server_volunteer_observe(uint32_t block_leader);
+#endif
 #ifdef PSX_OVERLAY_DLL_BUILD
 int psx_slice_block(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
 #else
 static inline int psx_slice_block(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
+#if defined(PSX_VOLUNTEER_SAMPLING) && defined(PSX_NO_DEBUG_TOOLS)
+    if (g_psx_fnprobe_armed) debug_server_volunteer_observe(block_addr);
+#endif
     if (!g_psx_precise_slice) return 0;
     return psx_slice_block_impl(cpu, block_addr, bcyc, side_effects);
 }

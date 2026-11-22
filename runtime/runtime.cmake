@@ -87,6 +87,18 @@ else()
     option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
 endif()
 
+# PSX_VOLUNTEER_SAMPLING: the `--muestreo` RAM sampler for volunteers (e1n4).
+# Independent of PSX_DEBUG_TOOLS: this option compiles ONLY what the sampler
+# needs (volunteer_sampling.c + the programmatic fnprobe already living in
+# debug_server.c + one block-leader hook), so it can run with
+# PSX_DEBUG_TOOLS=OFF. With BOTH options OFF the runtime is the plain release
+# build: no sampler, no extra block hook, nothing armed.
+#
+# The block hook rides the psx_slice_block() inline every generated block
+# leader already calls (PSX_ENABLE_BLOCK_CYCLES), so no recompiled C changes.
+option(PSX_VOLUNTEER_SAMPLING
+    "Build the volunteer RAM sampler (--muestreo) without the debug tools" OFF)
+
 # A title may opt in only after auditing every trusted media preparer used by
 # its mod commit. Older recomp-ui pins ignore this capability and remain sync.
 option(PSX_LAUNCHER_MOD_COMMIT_WORKER_SAFE
@@ -472,7 +484,6 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/card_read_summary.c
     ${PSXRECOMP_ROOT}/runtime/src/card_data_writes.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_capture.c
-    ${PSXRECOMP_ROOT}/runtime/src/volunteer_sampling.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_loader.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_path_canon.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_posix.c
@@ -515,6 +526,15 @@ if(PSX_DEBUG_TOOLS)
     list(APPEND PSXRECOMP_RUNTIME_SOURCES
         ${PSXRECOMP_ROOT}/recompiler/src/mips_decoder.cpp
         ${PSXRECOMP_ROOT}/runtime/src/disasm_shim.cpp)
+endif()
+
+# Volunteer RAM sampler (e1n4). Compiled for the debug-tools build too, so an
+# existing `build-voluntarios` keeps working unchanged; PSX_VOLUNTEER_SAMPLING
+# alone adds it to a PSX_DEBUG_TOOLS=OFF tree. Both options OFF => not compiled
+# at all, exactly like the release build.
+if(PSX_DEBUG_TOOLS OR PSX_VOLUNTEER_SAMPLING)
+    list(APPEND PSXRECOMP_RUNTIME_SOURCES
+        ${PSXRECOMP_ROOT}/runtime/src/volunteer_sampling.c)
 endif()
 
 # Optional delay-sync netplay (recomp-net). Auto-discovers a sibling checkout
@@ -2166,6 +2186,11 @@ function(psxrecomp_add_runtime_target target)
     # also visible to psx-beetle / non-runtime-helper targets.
     if(NOT PSX_DEBUG_TOOLS)
         target_compile_definitions(${target} PRIVATE PSX_NO_DEBUG_TOOLS=1)
+    endif()
+    if(PSX_VOLUNTEER_SAMPLING)
+        # Only carries what the sampler needs (fnprobe + its one block hook);
+        # PSX_NO_DEBUG_TOOLS above still strips the whole TCP server.
+        target_compile_definitions(${target} PRIVATE PSX_VOLUNTEER_SAMPLING=1)
     endif()
 
     if(PSXRECOMP_HAS_RECOMP_NET)

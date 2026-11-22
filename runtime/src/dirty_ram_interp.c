@@ -3281,6 +3281,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         debug_server_cyc_observe(pc & 0x1FFFFFFFu);
         g_ls_dirty_observe = 0;
 #endif
+#if defined(PSX_VOLUNTEER_SAMPLING) && defined(PSX_NO_DEBUG_TOOLS)
+        /* e1n4: same block-leader stream for interpreted code (the compiled
+         * path gets it from the psx_slice_block() inline). Disarmed = one
+         * load + branch; interpreted code is the cold path anyway. */
+        if (g_psx_fnprobe_armed) debug_server_volunteer_observe(pc & 0x1FFFFFFFu);
+#endif
 #ifdef PSX_COSIM
         { extern void cosim_block(uint32_t); cosim_block(pc); }
 #endif

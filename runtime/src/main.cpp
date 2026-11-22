@@ -121,7 +121,11 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "gpu_timeline.h"
 #include "crc32.h"
 #include "disc_identity.h"
-#include "volunteer_sampling.h"
+/* e1n4: the sampler is compiled in the debug-tools build (unchanged) and in a
+ * PSX_DEBUG_TOOLS=OFF build that opts in with PSX_VOLUNTEER_SAMPLING. */
+#if !defined(PSX_NO_DEBUG_TOOLS) || defined(PSX_VOLUNTEER_SAMPLING)
+#  include "volunteer_sampling.h"
+#endif
 #include "sbi_setup.h"
 #include "disc_path.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
@@ -3957,7 +3961,9 @@ static const char* netplay_start_failure(int nrc, const PsxNetplayConfig& cfg) {
 static void shutdown_runtime(void) {
     psx_local_mouse_clear();
     /* e1n2: disarm fnprobe, save counters and write the samples .zip. */
+#if !defined(PSX_NO_DEBUG_TOOLS) || defined(PSX_VOLUNTEER_SAMPLING)
     volunteer_sampling_shutdown();
+#endif
     /* (sljit removed 2026-07-15: overlay_compile_worker_stop joined the
      * off-thread JIT worker here; the worker no longer exists.) */
     psx_netplay_shutdown();
@@ -3984,7 +3990,9 @@ static void shutdown_runtime(void) {
 /* Tear down the game window/GL/audio after a lobby soft-return. Leaves SDL
  * subsystems and the lobby WebSocket intact for the next launcher session. */
 static void teardown_game_session_keep_lobby(void) {
+#if !defined(PSX_NO_DEBUG_TOOLS) || defined(PSX_VOLUNTEER_SAMPLING)
     volunteer_sampling_shutdown();
+#endif
     netplay_host_present_restore();
     psx_netplay_shutdown();
     psx_rewind_shutdown();
@@ -8462,7 +8470,9 @@ static NetplayVblankEpilogue sdl_vblank_present_body(void) {
                                  &g_runtime_perf.autocapture_ticks);
     }
     /* e1n2: volunteer RAM sampling (no-op unless --muestreo/PSX_MUESTREO). */
+#if !defined(PSX_NO_DEBUG_TOOLS) || defined(PSX_VOLUNTEER_SAMPLING)
     volunteer_sampling_tick();
+#endif
     {   /* Apply a finished batch compile via the active code provider (gcc:
          * cache rescan on done). */
         uint64_t perf_start = runtime_perf_section_begin();
@@ -19524,6 +19534,7 @@ session_reboot:
      * PSX_MUESTREO=<carpeta>. The disc check reuses the runtime's own
      * disc_identity (header + SYSTEM.CNF serial), so a wrong disc records
      * nothing and leaves NO_GRABADO.txt instead. */
+#if !defined(PSX_NO_DEBUG_TOOLS) || defined(PSX_VOLUNTEER_SAMPLING)
     {
         const char* muestreo_dir = cli_sampling_dir;
         if (!muestreo_dir) {
@@ -19550,6 +19561,9 @@ session_reboot:
                 disco_ok ? 1 : 0, detalle.c_str());
         }
     }
+#else
+    (void)cli_sampling_dir;   /* accepted by the CLI; no sampler in this build */
+#endif
 
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);

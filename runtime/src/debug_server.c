@@ -2743,7 +2743,14 @@ static inline void retprobe_observe(uint32_t block_leader_phys)
  * Disarmed = one branch. */
 #define FNPROBE_MAX_FNS  64
 #define FNPROBE_PENDING  1024
+/* e1n4: the volunteer-only build reads at most VS_N_RECORDS (512) records per
+ * 0.5 s cycle and saves 2; a 8192-entry ring keeps >12x that without the 12.6 MB
+ * of the debug default. The debug build keeps 32768 for full TCP dumps. */
+#if defined(PSX_VOLUNTEER_SAMPLING) && defined(PSX_NO_DEBUG_TOOLS)
+#define FNPROBE_CAP      8192
+#else
 #define FNPROBE_CAP      32768
+#endif
 #define FNPROBE_PHYS_WORDS (0x200000u >> 2)
 #define FNPROBE_SNAP_ENT   13
 #define FNPROBE_SNAP_BYTES (24 * FNPROBE_SNAP_ENT)
@@ -2776,7 +2783,17 @@ static void fnprobe_snapshot(uint8_t *out)
 typedef struct {
     uint32_t fi, ra, a0, a1, a2, a3, frame;
 } FnProbePend;
+/* e1n4: with the debug tools OFF the arm flag still has to be readable from
+ * the generated code's block hook (cpu_state.h), so in the volunteer-only
+ * build it is a normal global instead of a file-static. The debug build keeps
+ * the file-static (its block hook goes through debug_server_cyc_observe). */
+#if defined(PSX_VOLUNTEER_SAMPLING) && defined(PSX_NO_DEBUG_TOOLS)
+volatile int g_psx_fnprobe_armed = 0;
+#define FNP_ARMED g_psx_fnprobe_armed
+#else
 static volatile int s_fnp_armed = 0;
+#define FNP_ARMED s_fnp_armed
+#endif
 static int          s_fnp_nfns = 0;
 static uint32_t     s_fnp_fn[FNPROBE_MAX_FNS];
 static uint32_t     s_fnp_counts[FNPROBE_MAX_FNS];
@@ -2791,7 +2808,7 @@ static FnProbeRec   s_fnp_ring[FNPROBE_CAP];
 
 static inline void fnprobe_observe(uint32_t phys)
 {
-    if (!s_fnp_armed || phys >= 0x200000u) return;
+    if (!FNP_ARMED || phys >= 0x200000u) return;
     extern CPUState *debug_cpu_ptr;
     CPUState *cpu = debug_cpu_ptr;
     if (!cpu) return;
@@ -2847,7 +2864,7 @@ static int fnprobe_arm_core(const uint32_t *fns, int nfns, uint32_t max_recs,
                             const uint32_t *ram, int nram,
                             const uint32_t *ramrel, int nramrel, int snap)
 {
-    s_fnp_armed = 0;
+    FNP_ARMED = 0;
     s_fnp_seq = 0;
     s_fnp_npend = 0;
     memset(s_fnp_entry_mark, 0, sizeof(s_fnp_entry_mark));
@@ -2879,7 +2896,7 @@ static int fnprobe_arm_core(const uint32_t *fns, int nfns, uint32_t max_recs,
     if (max_recs < 1) max_recs = 1;
     if (max_recs > FNPROBE_CAP) max_recs = FNPROBE_CAP;
     s_fnp_max = (uint64_t)max_recs;
-    s_fnp_armed = 1;
+    FNP_ARMED = 1;
     return 1;
 }
 
@@ -2892,12 +2909,12 @@ int debug_server_fnprobe_start(const uint32_t *fns, int nfns, uint32_t max_recs,
 
 void debug_server_fnprobe_stop(void)
 {
-    s_fnp_armed = 0;
+    FNP_ARMED = 0;
 }
 
 int debug_server_fnprobe_armed(void)
 {
-    return s_fnp_armed ? 1 : 0;
+    return FNP_ARMED ? 1 : 0;
 }
 
 uint64_t debug_server_fnprobe_total(void)
@@ -2938,6 +2955,19 @@ int debug_server_fnprobe_copy_samples(uint64_t since, PsxFnProbeSample *out,
     }
     return n;
 }
+
+/* e1n4: block-leader entry point for the volunteer-only build. The generated
+ * code calls this through the psx_slice_block() inline in cpu_state.h (which
+ * every compiled block leader already invokes for PSX_ENABLE_BLOCK_CYCLES), so
+ * fnprobe works with PSX_DEBUG_TOOLS OFF and without any of the other
+ * per-block observers. Only compiled for that configuration; the debug build
+ * feeds the same fnprobe from debug_server_cyc_observe(). */
+#if defined(PSX_VOLUNTEER_SAMPLING) && defined(PSX_NO_DEBUG_TOOLS)
+void debug_server_volunteer_observe(uint32_t block_leader)
+{
+    fnprobe_observe(block_leader & 0x1FFFFFFFu);
+}
+#endif
 
 /* Exported per-basic-block-leader cycle observer. Emitted by the recompiler at
  * EVERY compiled block leader (under #ifndef PSX_NO_DEBUG_TOOLS, so prod builds
@@ -12082,7 +12112,7 @@ static void handle_fnprobe_arm(int id, const char *json)
 static void handle_fnprobe_disarm(int id, const char *json)
 {
     (void)json;
-    s_fnp_armed = 0;
+    FNP_ARMED = 0;
     send_fmt("{\"id\":%d,\"ok\":true,\"armed\":0,\"total\":%llu}",
              id, (unsigned long long)s_fnp_seq);
 }
@@ -12094,7 +12124,7 @@ static void handle_fnprobe_counts(int id, const char *json)
     int pos = 0;
     pos += snprintf(buf + pos, sizeof(buf) - pos,
                     "{\"id\":%d,\"ok\":true,\"armed\":%d,\"total\":%llu,\"pending\":%d,\"counts\":[",
-                    id, s_fnp_armed, (unsigned long long)s_fnp_seq, s_fnp_npend);
+                    id, FNP_ARMED, (unsigned long long)s_fnp_seq, s_fnp_npend);
     for (int i = 0; i < s_fnp_nfns; i++)
         pos += snprintf(buf + pos, sizeof(buf) - pos, "%s{\"fn\":\"0x%08X\",\"n\":%u}",
                         i ? "," : "", s_fnp_fn[i], s_fnp_counts[i]);
@@ -12118,7 +12148,7 @@ static void handle_fnprobe_dump(int id, const char *json)
     size_t pos = 0;
     pos += snprintf(buf + pos, BUF_SZ - pos,
                     "{\"id\":%d,\"ok\":true,\"armed\":%d,\"total\":%llu,\"oldest\":%llu,\"entries\":[",
-                    id, s_fnp_armed, (unsigned long long)total, (unsigned long long)oldest);
+                    id, FNP_ARMED, (unsigned long long)total, (unsigned long long)oldest);
     int emitted = 0;
     for (uint64_t s = since; s < total && emitted < count && pos < BUF_SZ - per; s++) {
         FnProbeRec *r = &s_fnp_ring[s % FNPROBE_CAP];

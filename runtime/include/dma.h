@@ -51,6 +51,17 @@ int      dma_gpu_linked_list_active(void);
  * leaves live RAM. */
 int      dma_host_cdrom_write(uint32_t dest, const uint8_t* src, uint32_t bytes, int lba);
 
+/* CD DMA transfer log (forward CH3 transfers into game-data RAM).
+ * cd_dma_log_get_entry keeps the historical (SetLoc LBA, dest, size) shape;
+ * cd_dma_log_get_entry_ex (e1n3) also returns the delivered sector, i.e. the
+ * sector whose bytes that transfer really drains. Out-of-range indices yield
+ * lba = -1. */
+uint32_t cd_dma_log_get_total(void);
+void     cd_dma_log_get_entry(uint32_t idx, int *lba, uint32_t *dest,
+                              uint32_t *size);
+void     cd_dma_log_get_entry_ex(uint32_t idx, int *lba, int *lba_entregado,
+                                 uint32_t *dest, uint32_t *size);
+
 typedef struct DMAChannelDebugState {
     uint32_t madr;
     uint32_t bcr;

@@ -87,20 +87,31 @@ static uint32_t gpu_ot_polls_this_walk;
 
 /* ---- CD DMA transfer log ---- */
 /* Every forward CH3 DMA that lands below 0x1C0000 (game data region) records
- * (setloc_lba, dest_addr, size). Transfers to 0x1C0000+ are FMV/streaming
- * buffers and are excluded to keep the ring focused on overlay loads.
- * Surfaced via the cd_read_log TCP command; pairs with overlay_dump to map
- * overlay regions back to disc positions for extract_overlays.py. */
+ * (setloc_lba, delivered_lba, dest_addr, size). Transfers to 0x1C0000+ are
+ * FMV/streaming buffers and are excluded to keep the ring focused on overlay
+ * loads. `lba` is the game's last SetLoc; `lba_entregado` is the sector whose
+ * bytes this transfer actually drains (cdrom_get_delivered_lba), which is
+ * what identifies the file when the guest re-seeks or streams. Surfaced via
+ * the cd_read_log TCP command (SetLoc, as before); pairs with overlay_dump to
+ * map overlay regions back to disc positions for extract_overlays.py. */
 #define CD_DMA_LOG_CAP 65536
-typedef struct { int lba; uint32_t dest; uint32_t size; } CdDmaEntry;
+typedef struct {
+    int lba;
+    int lba_entregado;   /* -1 = unknown */
+    uint32_t dest;
+    uint32_t size;
+} CdDmaEntry;
 static CdDmaEntry cd_dma_log[CD_DMA_LOG_CAP];
 static uint32_t   cd_dma_log_head  = 0;
 static uint32_t   cd_dma_log_total = 0;
 
-static void cd_dma_log_push(int lba, uint32_t dest, uint32_t size) {
-    cd_dma_log[cd_dma_log_head % CD_DMA_LOG_CAP].lba  = lba;
-    cd_dma_log[cd_dma_log_head % CD_DMA_LOG_CAP].dest = dest;
-    cd_dma_log[cd_dma_log_head % CD_DMA_LOG_CAP].size = size;
+static void cd_dma_log_push(int lba, int lba_entregado, uint32_t dest,
+                            uint32_t size) {
+    CdDmaEntry *e = &cd_dma_log[cd_dma_log_head % CD_DMA_LOG_CAP];
+    e->lba           = lba;
+    e->lba_entregado = lba_entregado;
+    e->dest          = dest;
+    e->size          = size;
     cd_dma_log_head = (cd_dma_log_head + 1) % CD_DMA_LOG_CAP;
     cd_dma_log_total++;
 }
@@ -109,11 +120,36 @@ uint32_t cd_dma_log_get_total(void) { return cd_dma_log_total; }
 void     cd_dma_log_get_entry(uint32_t idx, int *lba, uint32_t *dest, uint32_t *size) {
     uint32_t cap   = CD_DMA_LOG_CAP;
     uint32_t oldest = cd_dma_log_total > cap ? cd_dma_log_total - cap : 0;
-    if (idx < oldest || idx >= cd_dma_log_total) { *lba = -1; return; }
+    if (idx < oldest || idx >= cd_dma_log_total) {
+        if (lba) *lba = -1;
+        if (dest) *dest = 0;
+        if (size) *size = 0;
+        return;
+    }
     uint32_t slot = idx % cap;
-    *lba  = cd_dma_log[slot].lba;
-    *dest = cd_dma_log[slot].dest;
-    *size = cd_dma_log[slot].size;
+    if (lba)  *lba  = cd_dma_log[slot].lba;
+    if (dest) *dest = cd_dma_log[slot].dest;
+    if (size) *size = cd_dma_log[slot].size;
+}
+
+/* Same entry plus the delivered sector (e1n3). Kept separate so the
+ * cd_read_log TCP output and extract_overlays.py keep their exact shape. */
+void cd_dma_log_get_entry_ex(uint32_t idx, int *lba, int *lba_entregado,
+                             uint32_t *dest, uint32_t *size) {
+    uint32_t cap   = CD_DMA_LOG_CAP;
+    uint32_t oldest = cd_dma_log_total > cap ? cd_dma_log_total - cap : 0;
+    if (idx < oldest || idx >= cd_dma_log_total) {
+        if (lba) *lba = -1;
+        if (lba_entregado) *lba_entregado = -1;
+        if (dest) *dest = 0;
+        if (size) *size = 0;
+        return;
+    }
+    uint32_t slot = idx % cap;
+    if (lba) *lba = cd_dma_log[slot].lba;
+    if (lba_entregado) *lba_entregado = cd_dma_log[slot].lba_entregado;
+    if (dest) *dest = cd_dma_log[slot].dest;
+    if (size) *size = cd_dma_log[slot].size;
 }
 
 #define DMA_MDEC_IN_CYCLES_PER_WORD   1u
@@ -548,7 +584,7 @@ int dma_host_cdrom_write(uint32_t dest, const uint8_t *src, uint32_t bytes, int 
     }
     dirty_ram_mark_executable_range(addr, bytes);
     if (capture) {
-        if (lba >= 0) cd_dma_log_push(lba, addr, bytes);
+        if (lba >= 0) cd_dma_log_push(lba, lba, addr, bytes);
         extern uint8_t *memory_get_ram_ptr(void);
         overlay_capture_on_dma(addr, bytes, memory_get_ram_ptr() + addr);
     }
@@ -576,7 +612,9 @@ static void finish_async_cdrom_transfer(uint32_t final_addr) {
         if (size > psx_ram_live_bytes() - load_start)
             size = psx_ram_live_bytes() - load_start;
         int lba = cdrom_get_setloc_lba();
-        if (lba >= 0) cd_dma_log_push(lba, load_start, size);
+        int lba_entregado = cdrom_get_delivered_lba();
+        if (lba >= 0 || lba_entregado >= 0)
+            cd_dma_log_push(lba, lba_entregado, load_start, size);
 
         /* B-1: capture overlay bytes into the write-once capture set.
          * overlay_capture_on_dma auto-activates after game handoff and is a

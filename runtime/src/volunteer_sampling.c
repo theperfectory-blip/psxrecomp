@@ -1,12 +1,19 @@
-/* volunteer_sampling.c -- in-runtime RAM sampling for volunteers (e1n2).
+/* volunteer_sampling.c -- in-runtime RAM sampling for volunteers (e1n2/e1n3).
  *
  * Design: analisis/ab/voluntarios/DISENO.md. Summary:
  *  - Reads objetivos_voluntarios.tsv (next to the .exe) at start.
  *  - Uses the runtime's own CD DMA log (dma.c cd_dma_log_*) to know which
- *    overlay image is loaded. Only functions of the loaded image are armed,
- *    plus the EXE ones (always resident). Unknown image => EXE only.
+ *    overlay images are resident: a transfer is attributed to an image when
+ *    its destination lies inside that image's loaded span and either the
+ *    delivered sector or the SetLoc sector lies inside the file's sectors.
+ *    Images accumulate (GAME.BIN + ENTER.BIN + models can be resident at
+ *    once); an unknown transfer only invalidates the function entries it
+ *    actually overwrites. The EXE functions are always armed.
  *  - Arms/disarms the same fnprobe as the TCP fnprobe_* commands through the
- *    debug_server_fnprobe_* accessors, so nothing is duplicated.
+ *    debug_server_fnprobe_* accessors, so nothing is duplicated. Those live in
+ *    debug_server.c but do NOT require the debug tools: e1n4 adds
+ *    PSX_VOLUNTEER_SAMPLING, which compiles this file plus one block-leader
+ *    hook with PSX_DEBUG_TOOLS=OFF (no TCP server, no trace rings).
  *  - Writes muestras_<fecha>.jsonl in the selected folder, in the bot's format
  *    plus `imagen` and `pantalla`, and compresses it to muestras_<fecha>.zip on
  *    exit.
@@ -38,20 +45,33 @@ extern uint32_t psx_read_word(uint32_t addr);
 extern uint8_t  psx_read_byte(uint32_t addr);
 extern uint64_t s_frame_count;
 extern uint32_t cd_dma_log_get_total(void);
-extern void     cd_dma_log_get_entry(uint32_t idx, int *lba, uint32_t *dest,
-                                     uint32_t *size);
+/* e1n3: same entry plus the sector whose bytes the transfer really drains.
+ * dma.c builds both from the CD device state (SetLoc vs delivered sector);
+ * the delivered one is what identifies the file when the guest re-seeks. */
+extern void     cd_dma_log_get_entry_ex(uint32_t idx, int *lba,
+                                        int *lba_entregado, uint32_t *dest,
+                                        uint32_t *size);
 
 /* ---- Budget (see DISENO.md) --------------------------------------------- */
 #define VS_CICLO_FRAMES    30      /* 0,5 s a 60 cuadros/s                     */
+#define VS_DIAG_FRAMES   3600      /* una linea de diagnostico por minuto      */
 #define VS_MAX_POR_CICLO    2      /* muestras nuevas por ciclo (~4/s)         */
 #define VS_MAX_POR_FN      90      /* tope por funcion en toda la sesion       */
 #define VS_COMPLETA_MIN    60      /* con esto y ambos casos sale del reparto  */
-#define VS_N_RECORDS     2000      /* tope de registros del fnprobe por ciclo  */
+/* e1n4: the volunteer-only build reads fewer retained records per cycle (it
+ * saves at most 2) and its fnprobe ring shrinks to 8192; the .jsonl format and
+ * the selection rules do not change. The debug build keeps the old budgets. */
+#if defined(PSX_VOLUNTEER_SAMPLING) && defined(PSX_NO_DEBUG_TOOLS)
+#define VS_N_RECORDS      512
+#else
+#define VS_N_RECORDS     2000
+#endif
 #define VS_MAX_TOTAL    60000      /* tope de muestras por sesion              */
 #define VS_MAX_FNS       8192
 #define VS_MAX_IMGS        40
 #define VS_DISTINTOS        8      /* valores distintos que se recuerdan       */
 #define VS_DMA_SCAN      4096      /* transferencias que se revisan por vuelta */
+#define VS_SEC             2048u   /* bytes utiles de un sector del disco      */
 
 #define VS_ESTADO_ADDR 0x80075780u
 
@@ -72,6 +92,8 @@ typedef struct {
     uint16_t img;         /* indice en s_imgs (0 = EXE) */
     uint8_t  es_void;
     uint8_t  visto_bot;
+    uint8_t  residente;   /* su imagen se ha visto cargar por el CD */
+    uint8_t  pisada;      /* una transferencia posterior piso su entrada */
     uint32_t llamadores;
     uint32_t muestras;
     uint32_t ciclos_armada;
@@ -106,16 +128,17 @@ static uint32_t s_lote[PSX_FNPROBE_MAX_FNS];  /* virtuales, orden de armado */
 static int      s_lote_obj[PSX_FNPROBE_MAX_FNS];  /* indice en s_objs de cada uno */
 static int      s_nlote = 0;
 static int      s_armado = 0;
-static int      s_img_armada = -1;
 static uint64_t s_seq_desde = 0;
 static uint32_t s_fase_ini = 0;
 static uint32_t s_frame_ini = 0;
 static uint32_t s_ultimo_dma = 0;
-static int      s_img_actual = -1;   /* -1 = imagen desconocida */
+static int      s_img_actual = -1;   /* ultima imagen reconocida (-1 = ninguna) */
 static uint64_t s_prox_ciclo = 0;
+static uint64_t s_prox_diag = 0;
 static uint32_t s_ciclos = 0;
 static uint32_t s_escritas = 0;
 static uint32_t s_total_sesion = 0;
+static uint32_t s_nresidentes = 0;   /* objetivos de imagenes ya cargadas */
 
 /* ---- Utilidades --------------------------------------------------------- */
 static void vs_copia(char *dst, size_t cap, const char *src)
@@ -364,13 +387,95 @@ static void vs_guardar_estado(void)
     fclose(f);
 }
 
-/* ---- Imagen cargada (log de DMA del CD del propio runtime) -------------- */
-static int vs_zona_imagen(const VsImg *im, uint32_t dest, uint32_t size)
+/* ---- Imagenes residentes (log de DMA del CD del propio runtime) ---------- */
+/* Una imagen esta cargada cuando una transferencia cae dentro de su tramo de
+ * carga [base, base+sectores*2048) y su sector (el entregado por la unidad, o
+ * el SetLoc si aquel no se conoce) cae dentro de [lba, lba+sectores).
+ *
+ * e1n3: el modelo anterior guardaba una sola "imagen actual" y pasaba a
+ * "desconocida" ante cualquier transferencia que pisara el tramo completo del
+ * archivo. En este juego GAME.BIN (375 sectores desde 0x8007EB38) comparte
+ * direcciones con ENTER.BIN, SELECT.BIN, etc., y los datos del partido se
+ * cargan en medio de ese tramo: la imagen se invalidaba en el mismo ciclo y
+ * solo quedaban las funciones del EXE. Ahora las imagenes se acumulan (pueden
+ * convivir GAME.BIN y ENTER.BIN) y una transferencia desconocida solo marca
+ * como pisada la entrada de la funcion que realmente sobrescribe. */
+static uint32_t vs_img_base(const VsImg *im) { return im->base & 0x1FFFFFFFu; }
+static uint32_t vs_img_fin(const VsImg *im)
 {
-    uint32_t base_phys = im->base & 0x1FFFFFFFu;
-    uint32_t fin_prog  = base_phys + im->sectores * 2048u;
-    uint32_t fin_dma   = dest + (size ? size : 1u);
-    return dest < fin_prog && base_phys < fin_dma;
+    return vs_img_base(im) + im->sectores * VS_SEC;
+}
+
+/* 3 = sector entregado + destino; 2 = SetLoc + destino; 0 = no es esta imagen.
+ * Hace falta un sector conocido: sin el, una escritura de datos en medio del
+ * tramo de una imagen (p. ej. las texturas del partido) se confundiria con una
+ * carga suya. En una transferencia real el runtime siempre conoce el sector
+ * entregado (o, como minimo, el SetLoc). */
+static int vs_puntaje(const VsImg *im, int entregado, int setloc,
+                      uint32_t dest, uint32_t size)
+{
+    uint32_t base, fin;
+    if (im->sectores == 0) return 0;             /* EXE: no va por CD */
+    base = vs_img_base(im);
+    fin  = vs_img_fin(im);
+    if (dest < base || dest >= fin) return 0;
+    (void)size;
+    if (entregado >= 0 && (uint32_t)entregado >= im->lba &&
+        (uint32_t)entregado < im->lba + im->sectores) return 3;
+    if (setloc >= 0 && (uint32_t)setloc >= im->lba &&
+        (uint32_t)setloc < im->lba + im->sectores) return 2;
+    return 0;
+}
+
+static int vs_mejor_imagen(int entregado, int setloc, uint32_t dest,
+                           uint32_t size)
+{
+    int k, mejor = -1, mejor_p = 0;
+    for (k = 1; k < s_nimgs; k++) {              /* 0 = EXE */
+        int p = vs_puntaje(&s_imgs[k], entregado, setloc, dest, size);
+        if (p == 0) continue;
+        if (p > mejor_p ||
+            (p == mejor_p && k == s_img_actual) ||
+            (p == mejor_p && s_imgs[k].sectores < s_imgs[mejor].sectores)) {
+            mejor = k;
+            mejor_p = p;
+        }
+    }
+    return mejor;
+}
+
+/* Marca las funciones cuya PRIMERA instruccion cae en [lo, hi): esos bytes ya
+ * no son los de la imagen que las contenia. `excepto` no se toca (es la imagen
+ * que se esta cargando en esta misma transferencia). */
+static void vs_marcar_pisadas(uint32_t lo, uint32_t hi, int excepto)
+{
+    int i;
+    if (hi <= lo || s_nresidentes == 0) return;
+    for (i = 0; i < s_nobjs; i++) {
+        VsObj *o = &s_objs[i];
+        uint32_t a;
+        if (o->img == 0 || !o->residente || (int)o->img == excepto) continue;
+        a = o->addr & 0x1FFFFFFFu;
+        if (a >= lo && a < hi) o->pisada = 1;
+    }
+}
+
+/* Alta/refresco de la imagen `img`: sus funciones pasan a ser armables (las
+ * que cubre esta transferencia, o todas si la carga empieza en la base). */
+static void vs_marcar_cargada(int img, uint32_t dest, uint32_t size)
+{
+    const VsImg *im = &s_imgs[img];
+    uint32_t lo = dest, hi = dest + (size ? size : 1u);
+    int i;
+    for (i = 0; i < s_nobjs; i++) {
+        VsObj *o = &s_objs[i];
+        uint32_t a;
+        if ((int)o->img != img) continue;
+        if (!o->residente) { o->residente = 1; s_nresidentes++; }
+        a = o->addr & 0x1FFFFFFFu;
+        if (dest == vs_img_base(im) || (a >= lo && a < hi))
+            o->pisada = 0;
+    }
 }
 
 static void vs_actualizar_imagen(void)
@@ -381,28 +486,19 @@ static void vs_actualizar_imagen(void)
     desde = s_ultimo_dma;
     if (total - desde > VS_DMA_SCAN) desde = total - VS_DMA_SCAN;
     for (i = desde; i < total; i++) {
-        int lba = -1;
+        int lba = -1, entregado = -1;
         uint32_t dest = 0, size = 0;
-        int k;
-        int encontrada = -1;
-        cd_dma_log_get_entry(i, &lba, &dest, &size);
-        if (lba < 0) continue;
-        for (k = 0; k < s_nimgs; k++) {
-            const VsImg *im = &s_imgs[k];
-            if (dest != (im->base & 0x1FFFFFFFu)) continue;
-            if ((uint32_t)lba < im->lba ||
-                (uint32_t)lba >= im->lba + im->sectores) continue;
-            encontrada = k;
-            break;
+        int img;
+        cd_dma_log_get_entry_ex(i, &lba, &entregado, &dest, &size);
+        if (lba < 0 && entregado < 0 && size == 0) continue;  /* fuera del anillo */
+        img = vs_mejor_imagen(entregado, lba, dest, size);
+        if (img >= 0) {
+            vs_marcar_pisadas(dest, dest + (size ? size : 1u), img);
+            vs_marcar_cargada(img, dest, size);
+            s_img_actual = img;
+        } else {
+            vs_marcar_pisadas(dest, dest + (size ? size : 1u), -1);
         }
-        if (encontrada >= 0) {
-            s_img_actual = encontrada;
-            continue;
-        }
-        /* Una transferencia que pisa el codigo de la imagen actual con algo que
-         * no reconocemos (p. ej. un SELECT vacio) la invalida. */
-        if (s_img_actual >= 0 && vs_zona_imagen(&s_imgs[s_img_actual], dest, size))
-            s_img_actual = -1;
     }
     s_ultimo_dma = total;
 }
@@ -414,6 +510,13 @@ static int vs_clave(const void *pa, const void *pb)
     const VsObj *b = &s_objs[*(const int *)pb];
     long ka = (long)a->ciclos_armada * 5L - (long)a->ciclos_con_llamadas * 4L;
     long kb = (long)b->ciclos_armada * 5L - (long)b->ciclos_con_llamadas * 4L;
+    int ac = (a->img != 0 && (int)a->img == s_img_actual);
+    int bc = (b->img != 0 && (int)b->img == s_img_actual);
+    int ao = (a->img != 0), bo = (b->img != 0);
+    /* Primero la imagen de la ultima carga conocida (normalmente el partido). */
+    if (ac != bc) return ac ? -1 : 1;
+    /* Despues los overlays: sus funciones son las que el bot no pudo ver. */
+    if (ao != bo) return ao ? -1 : 1;
     if (ka != kb) return ka < kb ? -1 : 1;
     if (a->visto_bot != b->visto_bot) return a->visto_bot ? 1 : -1;
     if (a->llamadores != b->llamadores) return a->llamadores > b->llamadores ? -1 : 1;
@@ -426,7 +529,10 @@ static void vs_armar(void)
     int n = 0, m = 0, i, k;
     for (i = 0; i < s_nobjs; i++) {
         const VsObj *o = &s_objs[i];
-        if (o->img != 0 && (int)o->img != s_img_actual) continue;  /* 0 = EXE */
+        if (o->img != 0) {
+            /* Overlay: solo si su imagen se cargo y su entrada sigue intacta. */
+            if (!o->residente || o->pisada) continue;
+        }
         if (vs_completa(o)) continue;
         s_orden[n++] = i;
     }
@@ -451,7 +557,6 @@ static void vs_armar(void)
         return;
     }
     s_armado = 1;
-    s_img_armada = s_img_actual;
 }
 
 static void vs_linea(char *out, size_t cap, const VsObj *o,
@@ -521,11 +626,15 @@ static void vs_volcar(void)
             VsObj *o = NULL;
             int j, nuevo = 1;
             for (j = 0; j < s_nlote; j++) {
-                if (s_lote[j] != recs[k].fn) continue;
+                /* e1n3: fnprobe devuelve la direccion FISICA (ya sin
+                 * 0x80000000); s_lote guarda la virtual. Comparar sin enmascarar
+                 * era el motivo de que se contaran llamadas y no se guardara
+                 * ninguna muestra. */
+                if ((s_lote[j] & 0x1FFFFFFFu) != recs[k].fn) continue;
                 o = &s_objs[s_lote_obj[j]];
                 break;
             }
-            if (!o) continue;
+            if (!o || o->pisada) continue;
             for (j = 0; j < o->nv0; j++) if (o->v0[j] == recs[k].v0) { nuevo = 0; break; }
             if (!nuevo) continue;
             elegidas[nelegidas++] = k;
@@ -543,12 +652,12 @@ static void vs_volcar(void)
         VsObj *o = NULL;
         uint32_t llamadas = 0;
         for (j = 0; j < s_nlote; j++) {
-            if (s_lote[j] != r->fn) continue;
+            if ((s_lote[j] & 0x1FFFFFFFu) != r->fn) continue;
             o = &s_objs[s_lote_obj[j]];
             if (j < ncuentas) llamadas = cuentas[j];
             break;
         }
-        if (!o) continue;
+        if (!o || o->pisada) continue;
         o->muestras++;
         s_total_sesion++;
         if (r->v0 == 0) o->cero++; else o->no_cero++;
@@ -810,6 +919,7 @@ void volunteer_sampling_init(const char *carpeta, const char *exe_dir,
         s_ultimo_dma = t > VS_DMA_SCAN ? t - VS_DMA_SCAN : 0;
     }
     s_prox_ciclo = s_frame_count;
+    s_prox_diag  = s_frame_count + VS_DIAG_FRAMES;
     s_grabando = 1;
     fprintf(stdout, "muestreo: activo (%d objetivos, %d imagenes) -> %s\n",
             s_nobjs, s_nimgs, s_ruta_jsonl);
@@ -820,27 +930,30 @@ int volunteer_sampling_activo(void)
     return s_grabando;
 }
 
+/* Una linea por minuto para que la proxima prueba real diga que pasa. */
+static void vs_diagnostico(void)
+{
+    if (s_frame_count < s_prox_diag) return;
+    s_prox_diag = s_frame_count + VS_DIAG_FRAMES;
+    fprintf(stdout, "muestreo: imagen=%s armadas=%d muestras=%u\n",
+            (s_img_actual >= 0 && s_img_actual < s_nimgs)
+                ? s_imgs[s_img_actual].nombre : "desconocida",
+            s_nlote, s_escritas);
+    fflush(stdout);
+}
+
 void volunteer_sampling_tick(void)
 {
     if (!s_activo || !s_grabando) return;
     if (s_frame_count < s_prox_ciclo) return;
     s_prox_ciclo = s_frame_count + VS_CICLO_FRAMES;
 
+    /* e1n3: las imagenes se acumulan; no hay que volcar al cambiar de imagen,
+     * basta con rearmar el lote con las residentes no pisadas. */
     vs_actualizar_imagen();
-
-    /* La imagen cambio mientras habia un lote armado: volcar lo grabado (era de
-     * la imagen anterior) y rearmar con la nueva. */
-    if (s_armado && s_img_armada != s_img_actual) {
-        vs_volcar();
-        vs_armar();
-        return;
-    }
-    if (!s_armado) {
-        vs_armar();
-        return;
-    }
-    vs_volcar();
+    if (s_armado) vs_volcar();
     vs_armar();
+    vs_diagnostico();
 }
 
 void volunteer_sampling_shutdown(void)
