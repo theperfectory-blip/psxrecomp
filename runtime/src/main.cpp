@@ -129,6 +129,7 @@ extern "C" void psx_event_step_conservative_env_init(void);
 #include "sbi_setup.h"
 #include "disc_path.h"
 #include "iso_reader.h"      /* text-image guard: extract the boot EXE from the disc */
+#include "mando_asistente.h"  /* mandos genericos: mandos.txt + --configurar-mando */
 #include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #include "psx_window_icon.h"
 
@@ -15901,6 +15902,12 @@ int main(int argc, char** argv) {
     launcher_boot_timing_mark("host:main_enter");
 #endif
 
+    /* --configurar-mando: asistente para mandos que SDL no reconoce. Guarda
+     * mandos.txt junto al .exe y termina; no arranca el juego. */
+    for (int i = 1; i < argc; i++)
+        if (std::strcmp(argv[i], "--configurar-mando") == 0)
+            return psx_mando_asistente(exe_dir_from_argv(argv[0]));
+
     /* --audit-mod-plugins <manifest-root>...: build-time check, no emulation.
      * Every trusted implementation this executable registered must be named
      * by some authored manifest [[plugin]] id, or the plan can never activate
@@ -19158,22 +19165,20 @@ session_reboot:
      * antialiasing is on so the (super)sampled frame stays smooth when the
      * window is resized; nearest preserves crisp pixels otherwise. */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, g_video_aa ? "1" : "0");
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    /* Pistas de joystick: las aplica psx_mandos_aplicar_pistas() (mando_asistente.cpp)
+     * para que el asistente --configurar-mando vea el mismo GUID que el juego.
+     * Los comentarios que siguen explican cada pista. */
+    psx_mandos_aplicar_pistas();
     /* Prefer SDL's own HIDAPI driver over platform-native so Steam's virtual
      * Xbox controller (injected by Steam Input / Remote Play) is enumerated
      * as a game controller rather than a raw HID device. */
-    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
-    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
     /* SDL3 aliases the SDL2-era PS5 rumble hint to enhanced reports. Enabling
      * it also preserves DualSense rumble on the explicit SDL2 fallback. */
-    SDL_SetHintWithPriority(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1",
-                            SDL_HINT_OVERRIDE);
     /* ...but HIDAPI's Xbox sub-driver is OFF by default on Windows (Xbox pads are
      * normally RAWINPUT/XInput there). With RAWINPUT disabled above, a PHYSICAL
      * Xbox One/Series controller would be claimed by nobody -> not a GameController
      * -> zero input (PS5 DualSense works regardless: its HIDAPI driver is on by
      * default). Enable the HIDAPI Xbox driver so HIDAPI handles Xbox pads too. */
-    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
     if (!SDL_WasInit(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER)) {
     /* Per-monitor DPI awareness, BEFORE any SDL_Init.
      *
@@ -19198,6 +19203,9 @@ session_reboot:
             return 1;
         }
     }
+    /* Mapeos de mandos genericos (mandos.txt / gamecontrollerdb.txt) antes de
+     * abrir los mandos: sin ellos SDL no los trata como gamepad. */
+    psx_mandos_cargar(exe_dir_from_argv(argv[0]));
     load_input_config(argv[0]);
     /* The launcher / settings.toml / game.toml deadzone (when set) is the
      * user-facing authority; apply it over the input.ini value here, after

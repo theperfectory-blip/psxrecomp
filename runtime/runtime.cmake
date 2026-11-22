@@ -448,6 +448,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/psx_rewind.c
     ${PSXRECOMP_ROOT}/runtime/src/host_osd.c
     ${PSXRECOMP_ROOT}/runtime/src/host_keymap.c
+    ${PSXRECOMP_ROOT}/runtime/src/mando_asistente.cpp
     ${PSXRECOMP_ROOT}/runtime/src/cosim_state.c
     ${PSXRECOMP_ROOT}/runtime/src/cosim.c
     ${PSXRECOMP_ROOT}/runtime/src/traps.c
