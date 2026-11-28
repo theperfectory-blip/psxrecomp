@@ -15893,7 +15893,12 @@ static uint32_t gcs_gate_read_ram(uint32_t phys, uint32_t size) {
 int main(int argc, char** argv) {
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ);
-    std::setvbuf(stderr, nullptr, _IOLBF, BUFSIZ);
+    /* diag2: _IOLBF is NOT line buffering for a redirected stderr on this CRT
+     * (msvcrt/ucrt): it becomes full buffering, so every diagnostic written
+     * after this point was lost when the harness force-killed the process
+     * (Stop-Process). stderr is a diagnostic channel with low traffic: keep it
+     * unbuffered so a reject/abort message always reaches the log. */
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
     std::fprintf(stderr, "psxrecomp: main() entered\n");
     std::fprintf(stderr, "psxrecomp: execution=%s identity=%s\n",
                  PSX_EXECUTION_NAME, PSX_EXECUTION_ID);
@@ -20091,7 +20096,7 @@ session_reboot:
                             "  \"final_sp\": \"0x%08X\",\n  \"fntrace_seq\": %llu,\n  \"tail\": [\n",
                          cpu.pc, cpu.gpr[31], cpu.gpr[29],
                          (unsigned long long)g_fntrace_seq);
-            uint64_t seq = g_fntrace_seq;
+            uint64_t seq = g_fntrace_ring ? g_fntrace_seq : 0;   /* diag2: lazy ring */
             uint32_t n = seq < 128u ? (uint32_t)seq : 128u;
             for (uint32_t i = 0; i < n; i++) {
                 uint64_t idx = seq - n + i;

@@ -10,6 +10,7 @@
 
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* 2^22 frames @ 44100 ~= 95 s per tap. Power of two so wrap is a mask. */
@@ -28,7 +29,11 @@
 
 typedef struct {
 #ifndef PSX_NO_DEBUG_TOOLS
-    int16_t          pcm[PCM_RING_FRAMES * 2];
+    /* diag2: 16 MiB per tap used to be inline BSS (64 MiB committed at every
+     * launch). It is now a heap ring created when audio history is armed
+     * (PSX_AUDIO_TAPS=1, `diag_heavy on`, or any audio_* debug command). */
+    int16_t         *pcm;
+    uint64_t         pcm_from;  /* first frame stored in pcm (0 = since boot) */
 #endif
     _Atomic uint64_t head;      /* frames ever written; ring pos = head & MASK */
     uint64_t         nonzero;
@@ -54,8 +59,33 @@ uint32_t audio_trace_tap_rate(int tap)
     return s_tap_rate[tap];
 }
 
-static AudioTraceEvent  s_events[EV_RING_CAP];
+static AudioTraceEvent *s_events = NULL;   /* diag2: lazy (32 MiB when armed) */
 static _Atomic uint64_t s_event_head;
+
+/* diag2: audio history rings are opt-in. Counters (tap_frames/nonzero/audible/
+ * peak, pump/underrun/mute) keep working always; only the PCM history and the
+ * event ring wait for arm. Env: PSX_AUDIO_TAPS=1 (or PSX_DEBUG_HEAVY=1). */
+static int s_rings_on = -1;
+int audio_trace_arm_rings(int on) {
+    if (on) s_rings_on = 1;
+    else if (s_rings_on < 0) s_rings_on = 0;
+    return s_rings_on;
+}
+int audio_trace_rings_armed(void) { return s_rings_on > 0; }
+static int audio_rings_on(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (s_rings_on < 0) {
+        const char *a = getenv("PSX_AUDIO_TAPS");
+        const char *b = getenv("PSX_AUDIO_HISTORY");
+        const char *c = getenv("PSX_DEBUG_HEAVY");
+        s_rings_on = ((a && *a && *a != '0') || (b && *b && *b != '0') ||
+                      (c && *c && *c != '0')) ? 1 : 0;
+    }
+#else
+    s_rings_on = 0;
+#endif
+    return s_rings_on > 0;
+}
 
 static _Atomic uint32_t s_noted_frame;
 
@@ -70,8 +100,22 @@ static uint64_t s_unmute_events;
 
 void audio_trace_init(void)
 {
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (audio_rings_on() && !s_taps[0].pcm) {
+        for (int t = 0; t < AUDIO_TAP_COUNT; t++) {
+            s_taps[t].pcm = (int16_t *)calloc((size_t)PCM_RING_FRAMES * 2u,
+                                              sizeof(int16_t));
+            s_taps[t].pcm_from = 0;
+        }
+    }
+    if (audio_rings_on() && !s_events)
+        s_events = (AudioTraceEvent *)calloc(EV_RING_CAP, sizeof(AudioTraceEvent));
+#endif
     for (int t = 0; t < AUDIO_TAP_COUNT; t++) {
         atomic_store(&s_taps[t].head, 0);
+#ifndef PSX_NO_DEBUG_TOOLS
+        s_taps[t].pcm_from = 0;
+#endif
         s_taps[t].nonzero = 0;
         s_taps[t].audible = 0;
         s_taps[t].peak = 0;
@@ -97,14 +141,24 @@ void audio_trace_pcm(int tap, const int16_t *stereo, int frames)
     if (tap < 0 || tap >= AUDIO_TAP_COUNT || !stereo || frames <= 0) return;
     PcmTap *t = &s_taps[tap];
     uint64_t head = atomic_load_explicit(&t->head, memory_order_relaxed);
+#ifndef PSX_NO_DEBUG_TOOLS
+    /* diag2: create this tap's history on the first recorded frame if armed. */
+    if (!t->pcm && audio_rings_on()) {
+        t->pcm = (int16_t *)calloc((size_t)PCM_RING_FRAMES * 2u, sizeof(int16_t));
+        t->pcm_from = head;
+    }
+    int16_t *pcm = t->pcm;
+#endif
 
     for (int f = 0; f < frames; f++) {
         int16_t l = stereo[f * 2 + 0];
         int16_t r = stereo[f * 2 + 1];
 #ifndef PSX_NO_DEBUG_TOOLS
-        uint32_t pos = (uint32_t)((head + (uint64_t)f) & PCM_RING_MASK);
-        t->pcm[pos * 2 + 0] = l;
-        t->pcm[pos * 2 + 1] = r;
+        if (pcm) {
+            uint32_t pos = (uint32_t)((head + (uint64_t)f) & PCM_RING_MASK);
+            pcm[pos * 2 + 0] = l;
+            pcm[pos * 2 + 1] = r;
+        }
 #endif
         int32_t al = l < 0 ? -(int32_t)l : l;
         int32_t ar = r < 0 ? -(int32_t)r : r;
@@ -119,17 +173,24 @@ void audio_trace_pcm(int tap, const int16_t *stereo, int frames)
 
 void audio_trace_event(uint16_t kind, uint32_t a, uint32_t b)
 {
-    uint64_t seq = atomic_load_explicit(&s_event_head, memory_order_relaxed);
-    AudioTraceEvent *e = &s_events[(uint32_t)(seq & EV_RING_MASK)];
-    e->seq        = seq;
-    e->sample_idx = atomic_load_explicit(&s_taps[AUDIO_TAP_SPU_OUT].head,
-                                         memory_order_relaxed);
-    e->frame      = atomic_load_explicit(&s_noted_frame, memory_order_relaxed);
-    e->kind       = kind;
-    e->reserved   = 0;
-    e->a          = a;
-    e->b          = b;
-    atomic_store_explicit(&s_event_head, seq + 1, memory_order_release);
+    /* diag2: the 32 MiB event ring is armed on demand; counters below always run. */
+    if (audio_rings_on()) {
+        if (!s_events)
+            s_events = (AudioTraceEvent *)calloc(EV_RING_CAP, sizeof(AudioTraceEvent));
+        if (s_events) {
+            uint64_t seq = atomic_load_explicit(&s_event_head, memory_order_relaxed);
+            AudioTraceEvent *e = &s_events[(uint32_t)(seq & EV_RING_MASK)];
+            e->seq        = seq;
+            e->sample_idx = atomic_load_explicit(&s_taps[AUDIO_TAP_SPU_OUT].head,
+                                                 memory_order_relaxed);
+            e->frame      = atomic_load_explicit(&s_noted_frame, memory_order_relaxed);
+            e->kind       = kind;
+            e->reserved   = 0;
+            e->a          = a;
+            e->b          = b;
+            atomic_store_explicit(&s_event_head, seq + 1, memory_order_release);
+        }
+    }
 
     switch (kind) {
     case AUDIO_EV_RENDER:
@@ -175,12 +236,12 @@ uint64_t audio_trace_tap_total(int tap)
 
 uint64_t audio_trace_events_total(void)
 {
-    return atomic_load_explicit(&s_event_head, memory_order_acquire);
+    return s_events ? atomic_load_explicit(&s_event_head, memory_order_acquire) : 0;
 }
 
 uint32_t audio_trace_events_get(AudioTraceEvent *out, uint32_t max)
 {
-    if (!out || max == 0) return 0;
+    if (!out || max == 0 || !s_events) return 0;   /* diag2: lazy ring */
     uint64_t total = atomic_load_explicit(&s_event_head, memory_order_acquire);
     uint64_t avail = total < (uint64_t)EV_RING_CAP ? total : (uint64_t)EV_RING_CAP;
     if ((uint64_t)max > avail) max = (uint32_t)avail;
@@ -222,13 +283,18 @@ int64_t audio_trace_dump_wav(int tap, const char *path,
 {
     if (tap < 0 || tap >= AUDIO_TAP_COUNT || !path || !path[0]) return -1;
     PcmTap *t = &s_taps[tap];
+    if (!t->pcm) return -1;   /* diag2: history not armed (PSX_AUDIO_TAPS=1) */
 
     /* Snapshot the head; everything in [head - avail, head) is stable
      * (append-only, single writer) unless the writer laps us — the ring
      * holds ~95 s, a dump takes well under a second. */
     uint64_t head  = atomic_load_explicit(&t->head, memory_order_acquire);
+    if (t->pcm_from > head) t->pcm_from = head;   /* diag2: arming point */
     uint64_t avail = head < (uint64_t)PCM_RING_FRAMES ? head
                                                       : (uint64_t)PCM_RING_FRAMES;
+    if (t->pcm_from != 0u && head >= t->pcm_from &&
+        avail > head - t->pcm_from)
+        avail = head - t->pcm_from;             /* nothing before arming */
     if (avail == 0) return -1;
     uint64_t oldest = head - avail;
 

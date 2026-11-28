@@ -809,7 +809,7 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
 
     /* dirty_block_log tail (last 100) */
     {
-        uint64_t total = g_dirty_ram_block_log_seq;
+        uint64_t total = g_dirty_ram_block_log ? g_dirty_ram_block_log_seq : 0; /* diag2: lazy ring */
         uint64_t avail = (total < DIRTY_RAM_BLOCK_LOG_CAP) ? total : DIRTY_RAM_BLOCK_LOG_CAP;
         int count = (int)((avail < 100) ? avail : 100);
         append_fmt(buf, sizeof(buf), &pos,

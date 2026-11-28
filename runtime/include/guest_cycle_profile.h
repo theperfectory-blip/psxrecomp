@@ -26,6 +26,10 @@ typedef struct GcpSample {
 
 /* Install the sampler (period from PSX_GCP_PERIOD, default 4096; 0 = off). */
 void     guest_cycle_profile_install(void);
+/* diag2: on-demand arm — allocates the 20 MiB sample ring and installs the
+ * cycle hook. Launch-time arming is PSX_GCP=1 / PSX_GCP_PERIOD=N /
+ * PSX_DEBUG_HEAVY=1. */
+int      guest_cycle_profile_arm(int on);
 uint32_t guest_cycle_profile_period(void);
 uint64_t guest_cycle_profile_total(void);
 uint32_t guest_cycle_profile_capacity(void);

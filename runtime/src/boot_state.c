@@ -950,9 +950,16 @@ int boot_state_check_buffer(const uint8_t* file, size_t file_len,
                      psx_ram_8mb_active() ? 2u : 8u,
                      (unsigned)(memory_get_ram_bytes() >> 20));
             boot_state_append_reason(reason, reason_cap, part);
-        } else {
-            boot_state_append_reason(reason, reason_cap, "enhancement_memory_layout_or_execution_profile");
+            return 0;
         }
+        /* diag2 (usuario, 2026-11-27): un estado de OTRA versión no se carga
+         * nunca (ni identidad ni codegen distintos). Se rechaza siempre, pero
+         * ahora con el motivo en stderr (sin búfer, main.cpp) en vez de perderse. */
+        snprintf(part, sizeof(part),
+                 "identidad=%08X(want %08X): otra version del runtime",
+                 (unsigned)h.reserved,
+                 (unsigned)boot_state_layout_cookie());
+        boot_state_append_reason(reason, reason_cap, part);
         return 0;
     }
     if (h.version < BOOT_STATE_VERSION_MIN_READ ||
@@ -973,7 +980,10 @@ int boot_state_check_buffer(const uint8_t* file, size_t file_len,
         boot_state_append_reason(reason, reason_cap, part);
     }
     if (h.codegen_hash != (uint32_t)PSX_OVERLAY_CODEGEN_HASH) {
-        snprintf(part, sizeof(part), "codegen_hash=%08X(want %08X)",
+        /* diag2 (usuario, 2026-11-27): estado de otra compilación del juego
+         * recompilado: se rechaza siempre (hay que regrabar el estado). */
+        snprintf(part, sizeof(part),
+                 "codegen_hash=%08X(want %08X): otra compilacion del juego",
                  (unsigned)h.codegen_hash,
                  (unsigned)PSX_OVERLAY_CODEGEN_HASH);
         boot_state_append_reason(reason, reason_cap, part);
@@ -1024,12 +1034,24 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
                 reject[0] ? reject : "unknown");
         return 0;
     }
-    if (!boot_state_parse_header(file, file_len, &h))
+    if (!boot_state_parse_header(file, file_len, &h)) {
+        fprintf(stderr, "boot_state: reject — header parse failed (%zu bytes)\n",
+                file_len);
         return 0;
-    if (h.section_count == 0u || h.section_count > BOOT_STATE_MAX_SECTIONS)
+    }
+    if (h.section_count == 0u || h.section_count > BOOT_STATE_MAX_SECTIONS) {
+        fprintf(stderr,
+                "boot_state: reject — bad section_count=%u (max %u)\n",
+                (unsigned)h.section_count, (unsigned)BOOT_STATE_MAX_SECTIONS);
         return 0;
+    }
     sections = (BsSection*)calloc(h.section_count, sizeof(*sections));
-    if (!sections) return 0;
+    if (!sections) {
+        fprintf(stderr,
+                "boot_state: reject — calloc(%u sections) failed\n",
+                (unsigned)h.section_count);
+        return 0;
+    }
 
     cur = file + BOOT_STATE_HEADER_WIRE_BYTES;
     end = file + file_len;
@@ -1040,21 +1062,28 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
      * tail, a missing required section) left sections 0..N-1 -- the CPU
      * first of all -- already restored: savestate/rewind/netplay then
      * reported a failed load over a half-overwritten machine. */
+    /* diag2: name the failing section instead of failing silently. */
+    const char *why = NULL;
+    uint32_t bad_tag = 0, bad_i = 0;
+    uint64_t bad_len = 0;
     for (uint32_t i = 0; ok && i < h.section_count; i++) {
         PstR sh;
         uint32_t tag = 0, pad = 0;
         uint64_t len = 0;
         const uint8_t* payload;
         BsSection* s = &sections[n_sections];
+        bad_i = i;
 
-        if ((size_t)(end - cur) < 16u) { ok = 0; break; }
+        if ((size_t)(end - cur) < 16u) { ok = 0; why = "truncated section header"; break; }
         pst_r_init(&sh, cur, 16);
         if (!pst_r_u32(&sh, &tag) || !pst_r_u32(&sh, &pad) || !pst_r_u64(&sh, &len)) {
-            ok = 0; break;
+            ok = 0; why = "section header parse"; break;
         }
         cur += 16;
+        bad_tag = tag;
+        bad_len = len;
         if (len > 64u * 1024u * 1024u || (uint64_t)(end - cur) < len) {
-            ok = 0; break;
+            ok = 0; why = "section payload truncated/too large"; break;
         }
         payload = cur;
         cur += (size_t)len;
@@ -1064,21 +1093,21 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
             uint32_t raw_len = 0;
             uLong dest_len;
             double t_inf;
-            if (len < 4u) { ok = 0; break; }
+            if (len < 4u) { ok = 0; why = "zlib header truncated"; break; }
             pst_r_init(&lr, payload, 4);
             if (!pst_r_u32(&lr, &raw_len) || raw_len == 0 ||
                 raw_len > 64u * 1024u * 1024u) {
-                ok = 0; break;
+                ok = 0; why = "zlib raw length invalid"; break;
             }
             s->owned = (uint8_t*)malloc(raw_len);
-            if (!s->owned) { ok = 0; break; }
+            if (!s->owned) { ok = 0; why = "oom inflating section"; break; }
             n_sections++;   /* owned buffer is freed below on every path */
             dest_len = (uLong)raw_len;
             t_inf = boot_state_mono_ms();
             if (uncompress(s->owned, &dest_len, payload + 4,
                            (uLong)(len - 4u)) != Z_OK ||
                 dest_len != (uLong)raw_len) {
-                ok = 0;
+                ok = 0; why = "zlib inflate failed";
                 break;
             }
             inflate_ms += boot_state_mono_ms() - t_inf;
@@ -1087,24 +1116,42 @@ int boot_state_load_buffer(const uint8_t* file, size_t file_len,
         } else if (pad != 0u) {
             /* v3 requires pad==0; v4 unknown/extra flags are a hard reject. */
             ok = 0;
+            why = "unknown section flags";
             break;
         } else {
-            if (len > 0xffffffffu) { ok = 0; break; }
+            if (len > 0xffffffffu) { ok = 0; why = "section too large"; break; }
             n_sections++;
             s->p = payload;
             s->len = (uint32_t)len;
         }
         s->tag = tag;
-        if (!validate_section(tag, s->p, s->len)) { ok = 0; break; }
+        if (!validate_section(tag, s->p, s->len)) {
+            ok = 0; why = "section validation failed"; break;
+        }
         if (tag == BS_SEC_GAME_START && (seen & (1u << tag))) {
-            ok = 0; break;
+            ok = 0; why = "duplicate GAME_START"; break;
         }
         if (tag < 32) seen |= (1u << tag);
     }
-    if (ok && (seen & required) != required)
+    if (ok && (seen & required) != required) {
         ok = 0;
-    if (ok && h.version >= 9u && !(seen & (1u << BS_SEC_GAME_START)))
+        why = "missing required section";
+        bad_tag = required & ~seen;
+        bad_len = 0;
+    }
+    if (ok && h.version >= 9u && !(seen & (1u << BS_SEC_GAME_START))) {
         ok = 0;
+        why = "missing GAME_START (v9)";
+        bad_tag = 1u << BS_SEC_GAME_START;
+    }
+    if (!ok) {
+        fprintf(stderr,
+                "boot_state: reject — %s (section %u tag=%u/%08X len=%llu)\n",
+                why ? why : "unknown", (unsigned)bad_i, (unsigned)bad_tag,
+                (unsigned)(bad_tag < 32 ? (1u << bad_tag) : 0u),
+                (unsigned long long)bad_len);
+        fflush(stderr);
+    }
 
     /* PASS 2 -- apply. Every section passed validate_section, whose checks
      * are exactly the preconditions apply_section can fail on, so this pass
@@ -1160,7 +1207,10 @@ int boot_state_load(const char* path, uint32_t bios_checksum,
                 path ? path : "(null)");
         return 0;
     }
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return 0; }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fprintf(stderr, "boot_state: reject — seek failed for %s\n", path);
+        fclose(f); return 0;
+    }
     sz = ftell(f);
     if (sz < (long)BOOT_STATE_HEADER_WIRE_BYTES || sz > 64L * 1024L * 1024L) {
         fprintf(stderr, "boot_state: reject — bad size %ld for %s\n",
@@ -1168,11 +1218,20 @@ int boot_state_load(const char* path, uint32_t bios_checksum,
         fclose(f);
         return 0;
     }
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return 0; }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fprintf(stderr, "boot_state: reject — rewind failed for %s\n", path);
+        fclose(f); return 0;
+    }
     file_len = (size_t)sz;
     file = (uint8_t*)malloc(file_len);
-    if (!file) { fclose(f); return 0; }
+    if (!file) {
+        fprintf(stderr, "boot_state: reject — malloc(%zu) failed for %s\n",
+                file_len, path);
+        fclose(f); return 0;
+    }
     if (fread(file, 1, file_len, f) != file_len) {
+        fprintf(stderr, "boot_state: reject — short read (%zu bytes) of %s\n",
+                file_len, path);
         free(file);
         fclose(f);
         return 0;

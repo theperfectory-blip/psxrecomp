@@ -114,6 +114,9 @@ typedef struct PsxHleCallEntry {
  * i (seq-CAP .. seq-1 valid window) returns the ring slot for that sequence. */
 uint64_t               psx_hle_ring_seq(void);
 const PsxHleCallEntry* psx_hle_ring_entry(uint64_t seq_index);
+/* diag2: the ring is heap-allocated on first arm (was 32 MiB of BSS). */
+int psx_hle_ring_arm(int on);
+int psx_hle_ring_is_armed(void);
 
 #ifdef __cplusplus
 }

@@ -199,6 +199,13 @@ int savestate_title_blocked(void) { return s_title_blocked; }
 void savestate_set_title_blocked(int blocked) {
     s_title_blocked = blocked != 0;
     if (!s_title_blocked) return;
+    /* diag2: never drop a staged request silently. */
+    if (s_save_pending >= 0 || s_load_pending >= 0)
+        fprintf(stderr,
+                "savestate: dropping staged %s slot %d — save states blocked "
+                "in this game mode\n",
+                s_load_pending >= 0 ? "load" : "save",
+                s_load_pending >= 0 ? s_load_pending : s_save_pending);
     if (s_save_pending >= 0 || s_save_defer_slot >= 0) s_save_failed = 1;
     if (s_load_pending >= 0) s_load_failed = 1;
     s_save_pending = s_load_pending = s_save_defer_slot = -1;
@@ -973,6 +980,9 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
                 s_status_pending = 0;
                 s_status_last_ok = 0;
                 s_status_generation++;
+                fprintf(stderr,
+                        "savestate: SAVE FAILED slot %d — no state path "
+                        "(save dir not configured?)\n", slot);
                 psx_frontend_on_savestate_notify(0, slot, 0);
             }
         }
@@ -1007,6 +1017,8 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
 #endif
         if (s_load_blob && s_load_blob_len > 0) {
             const size_t blob_len = s_load_blob_len;
+            fprintf(stderr, "savestate: LOADING slot %d from memory blob (%zu bytes)\n",
+                    slot, blob_len);
             loaded = boot_state_load_buffer(s_load_blob, blob_len,
                                             s_bios_checksum, s_entry_pc, cpu);
             clear_load_blob();
@@ -1018,6 +1030,7 @@ void savestate_poll(CPUState* cpu, uint32_t resume_pc) {
                 psx_frontend_on_savestate_notify(1, slot, 0);
             }
         } else if (savestate_slot_path(slot, path, sizeof(path))) {
+            fprintf(stderr, "savestate: LOADING slot %d from %s\n", slot, path);
             loaded = boot_state_load(path, s_bios_checksum, s_entry_pc, cpu);
             if (!loaded) {
                 fprintf(stderr,

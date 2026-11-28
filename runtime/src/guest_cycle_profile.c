@@ -46,11 +46,22 @@ extern void (*psx_cycle_sample_hook)(uint64_t cycle, uint32_t periods);
 
 #define GCP_CAP (1u << 19)
 
-static PSX_BSS GcpSample s_gcp[GCP_CAP];
+/* diag2: the per-cycle sample ring (20 MiB) used to be BSS and the sampling
+ * hook was installed at every boot. It is now armed on demand: PSX_GCP_PERIOD
+ * (or PSX_GCP=1 / PSX_DEBUG_HEAVY=1) at launch, or the guest_cycle_profile
+ * command. The hook is only installed once the ring exists. */
+static GcpSample *s_gcp = NULL;
 static uint64_t s_gcp_total = 0;
+
+static int gcp_ensure(void) {
+    if (!s_gcp)
+        s_gcp = (GcpSample *)calloc(GCP_CAP, sizeof(GcpSample));
+    return s_gcp != NULL;
+}
 
 static void gcp_record(uint64_t cycle, uint32_t periods)
 {
+    if (!s_gcp) return;
     GcpSample *e = &s_gcp[s_gcp_total & (GCP_CAP - 1u)];
     e->cycle  = cycle;
     e->frame  = (uint32_t)s_frame_count;
@@ -69,9 +80,24 @@ void guest_cycle_profile_install(void)
 {
     uint32_t period = 4096u;
     const char *env = getenv("PSX_GCP_PERIOD");
+    const char *on  = getenv("PSX_GCP");
+    const char *hv  = getenv("PSX_DEBUG_HEAVY");
     if (env && *env) period = (uint32_t)strtoul(env, NULL, 0);
-    psx_cycle_sample_hook = gcp_record;
     psx_cycle_sample_period = period;
+    if (!((env && *env) || (on && *on && *on != '0') ||
+          (hv && *hv && *hv != '0')))
+        return;                       /* diag2: not armed — no hook, no ring */
+    if (!gcp_ensure()) return;
+    psx_cycle_sample_hook = gcp_record;
+}
+
+int guest_cycle_profile_arm(int on)
+{
+    if (!on) return s_gcp != NULL;
+    if (!gcp_ensure()) return 0;
+    if (psx_cycle_sample_period == 0u) psx_cycle_sample_period = 4096u;
+    psx_cycle_sample_hook = gcp_record;
+    return 1;
 }
 
 uint32_t guest_cycle_profile_period(void) { return psx_cycle_sample_period; }
@@ -80,6 +106,7 @@ uint32_t guest_cycle_profile_capacity(void) { return GCP_CAP; }
 
 int guest_cycle_profile_get(uint64_t seq, GcpSample *out)
 {
+    if (!s_gcp || !out) return 0;   /* diag2: lazy ring */
     if (seq >= s_gcp_total) return 0;
     if (s_gcp_total - seq > GCP_CAP) return 0;
     *out = s_gcp[seq & (GCP_CAP - 1u)];
@@ -88,6 +115,7 @@ int guest_cycle_profile_get(uint64_t seq, GcpSample *out)
 
 uint64_t guest_cycle_profile_oldest(void)
 {
+    if (!s_gcp) return 0;
     return s_gcp_total > GCP_CAP ? s_gcp_total - GCP_CAP : 0;
 }
 
@@ -97,6 +125,7 @@ int guest_cycle_profile_write_csv(const char *path, uint64_t frame_lo,
 {
     FILE *f = fopen(path, "wb");
     if (!f) return 0;
+    if (!s_gcp) { fclose(f); return 0; }   /* diag2: ring never armed */
     fprintf(f, "seq,cycle,frame,weight,phase,flags,block,fn,ra,native,disp\n");
     uint64_t rows = 0, weight = 0;
     for (uint64_t s = guest_cycle_profile_oldest(); s < s_gcp_total; s++) {

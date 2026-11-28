@@ -46,7 +46,10 @@ typedef struct {
     uint32_t sp;        /* cpu->gpr[29] — for func_8001A954 SP/RA-lifecycle oracle */
 } FntraceEntry;
 
-extern FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
+/* diag2: call ring is allocated on the first armed record (fntrace_arm) instead
+ * of committing 144 MiB of BSS at every launch. Readers must handle NULL. */
+extern FntraceEntry *g_fntrace_ring;
+FntraceEntry *fntrace_ring_ensure(void);
 extern uint64_t     g_fntrace_seq;     /* monotonic; index into ring = seq % CAP */
 
 /* ── Stack-domain transition ring (ALWAYS-ON, every build) ──────────────────

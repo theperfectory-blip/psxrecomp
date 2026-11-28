@@ -4344,8 +4344,13 @@ typedef struct {
     uint32_t out_regs[34];   /* r0..r31, hi, lo at exit                        */
 } FpEnt;
 #define FP_CAP (1u << 16)   /* ~19 MB with full reg files; ~65K executions     */
-static FpEnt    s_fp[FP_CAP];
+static FpEnt   *s_fp = NULL;    /* diag2: lazy (allocated by the first fp log) */
 static uint64_t s_fp_seq = 0;
+
+static FpEnt *overlay_fp_ensure(void) {
+    if (!s_fp) s_fp = (FpEnt *)calloc(FP_CAP, sizeof(FpEnt));
+    return s_fp;
+}
 
 int overlay_loader_is_candidate(uint32_t phys) {
     if (!s_active) return 0;
@@ -4980,6 +4985,7 @@ void overlay_fp_log(uint32_t addr, const uint32_t *in_regs,
                     const CPUState *cpu, int native) {
     extern uint64_t psx_get_cycle_count(void);
     uint64_t s = s_fp_seq++;
+    if (!overlay_fp_ensure()) return;   /* diag2: lazy ring */
     FpEnt *e = &s_fp[s & (FP_CAP - 1u)];
     e->seq = s; e->cycle = psx_get_cycle_count();
     e->addr = addr & 0x1FFFFFFFu; e->native = native;
@@ -5034,7 +5040,7 @@ int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
 int overlay_loader_write_fp_file(const char *path) {
     FILE *f = fopen(path, "w");
     if (!f) return -1;
-    uint64_t total = s_fp_seq;
+    uint64_t total = s_fp ? s_fp_seq : 0;   /* diag2: lazy ring */
     uint64_t start = (total > FP_CAP) ? (total - FP_CAP) : 0;
     fputc('[', f);
     int first = 1, count = 0;

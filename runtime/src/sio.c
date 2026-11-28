@@ -452,14 +452,39 @@ static int sio_tx_writes = 0;       /* ANY write to SIO_TX_DATA */
 static int sio_tx_gated = 0;        /* writes gated by missing TX_EN */
 static uint16_t sio_last_ctrl_on_tx = 0; /* CTRL at last TX write */
 
+/* ---- diag2: SIO forensic rings are opt-in -----------------------------
+ * The byte trace, card transaction and IRQ#7 rings were ~102 MiB of committed
+ * BSS at every launch (28 + 34 + 40). They now arm on demand: PSX_SIO_TRACE=1
+ * (or PSX_DEBUG_HEAVY=1) at boot, `diag_heavy on`, or the first sio_* debug
+ * command. sio_get_seq() keeps counting bytes even while disarmed so the other
+ * rings' cross-references stay meaningful. */
+static int s_rings_on = -1;
+int sio_rings_arm(int on) {
+    if (on) s_rings_on = 1;
+    else if (s_rings_on < 0) s_rings_on = 0;
+    return s_rings_on;
+}
+int sio_rings_armed(void) { return s_rings_on > 0; }
+static int sio_rings_on(void) {
+    if (s_rings_on < 0) {
+        const char *a = getenv("PSX_SIO_TRACE");
+        const char *b = getenv("PSX_DEBUG_HEAVY");
+        s_rings_on = ((a && *a && *a != '0') || (b && *b && *b != '0')) ? 1 : 0;
+    }
+    return s_rings_on > 0;
+}
+
 /* ---- SIO byte-level trace ring buffer ---- */
-static PSX_BSS SioTraceEntry sio_trace_buf[SIO_TRACE_CAP];
+static SioTraceEntry *sio_trace_buf = NULL;   /* diag2: lazy */
 static int sio_trace_idx = 0;       /* next write position */
 static uint32_t sio_trace_seq = 0;  /* monotonic sequence number */
+static uint32_t sio_trace_first = 0;/* first seq stored in the ring */
+
+uint32_t sio_trace_first_seq(void) { return sio_trace_buf ? sio_trace_first : 0; }
 
 uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out) {
     if (buf_out) *buf_out = sio_trace_buf;
-    if (write_idx_out) *write_idx_out = sio_trace_idx;
+    if (write_idx_out) *write_idx_out = sio_trace_buf ? sio_trace_idx : 0;
     return sio_trace_seq;
 }
 
@@ -616,15 +641,18 @@ static void sr_record(uint8_t kind, uint8_t tx, uint8_t rx) {
 
 
 /* ---- Card transaction ring buffer ---- */
-static PSX_BSS SioTxnEntry sio_txn_buf[SIO_TXN_CAP];
+static SioTxnEntry *sio_txn_buf = NULL;   /* diag2: lazy */
 static int       sio_txn_idx = 0;        /* next-write slot */
 static uint32_t  sio_txn_seq = 0;        /* monotonic id of next-to-close */
+static uint32_t  sio_txn_first = 0;
 static int sio_txn_open = 0;
 static SioTxnEntry sio_txn_cur;          /* in-progress txn, flushed on close */
 
+uint32_t sio_txn_first_seq(void) { return sio_txn_buf ? sio_txn_first : 0; }
+
 uint32_t sio_get_card_txns(const SioTxnEntry **buf_out, int *write_idx_out, int *open_out) {
     if (buf_out) *buf_out = sio_txn_buf;
-    if (write_idx_out) *write_idx_out = sio_txn_idx;
+    if (write_idx_out) *write_idx_out = sio_txn_buf ? sio_txn_idx : 0;
     if (open_out) *open_out = sio_txn_open;
     return sio_txn_seq;
 }
@@ -676,16 +704,26 @@ static void txn_close(uint8_t end_reason, uint8_t terminal_state, uint32_t func)
         s_card_handoff_armed = 1;
         card_handoff_push(1, 0x52);
     }
-    sio_txn_buf[sio_txn_idx]   = sio_txn_cur;
-    sio_txn_idx = (sio_txn_idx + 1) % SIO_TXN_CAP;
+    if (sio_rings_on() && !sio_txn_buf) {   /* diag2: lazy ring */
+        sio_txn_buf = (SioTxnEntry *)calloc(SIO_TXN_CAP, sizeof(SioTxnEntry));
+        if (sio_txn_buf) {
+            sio_txn_idx = (int)(sio_txn_seq % SIO_TXN_CAP);
+            sio_txn_first = sio_txn_seq;
+        }
+    }
+    if (sio_txn_buf) {
+        sio_txn_buf[sio_txn_idx]   = sio_txn_cur;
+        sio_txn_idx = (sio_txn_idx + 1) % SIO_TXN_CAP;
+    }
     sio_txn_seq++;
     sio_txn_open = 0;
 }
 
 /* ---- SIO IRQ #7 delivery ring ---- */
-static PSX_BSS SioIrqEntry sio_irq_buf[SIO_IRQ_RING_CAP];
+static SioIrqEntry *sio_irq_buf = NULL;   /* diag2: lazy */
 static int       sio_irq_idx = 0;
 static uint32_t  sio_irq_seq = 0;
+static uint32_t  sio_irq_first = 0;
 
 /* Pending-IRQ context — captured when the countdown is armed, used when it fires. */
 static uint8_t   sio_irq_pending_source     = SIO_IRQ_SRC_UNKNOWN;
@@ -694,9 +732,11 @@ static uint8_t   sio_irq_pending_delay      = 0;
 static uint8_t   sio_irq_pending_mc_state   = 0;
 static uint32_t  sio_irq_pending_byte_seq   = 0;
 
+uint32_t sio_irq_first_seq(void) { return sio_irq_buf ? sio_irq_first : 0; }
+
 uint32_t sio_get_irq_ring(const SioIrqEntry **buf_out, int *write_idx_out) {
     if (buf_out) *buf_out = sio_irq_buf;
-    if (write_idx_out) *write_idx_out = sio_irq_idx;
+    if (write_idx_out) *write_idx_out = sio_irq_buf ? sio_irq_idx : 0;
     return sio_irq_seq;
 }
 
@@ -2079,6 +2119,15 @@ static void sio_process_byte(uint8_t tx_byte) {
 
     /* ---- Trace: capture post-state and record entry ---- */
     {
+        if (sio_rings_on() && !sio_trace_buf) {   /* diag2: lazy ring */
+            sio_trace_buf = (SioTraceEntry *)calloc(SIO_TRACE_CAP,
+                                                    sizeof(SioTraceEntry));
+            if (sio_trace_buf) {
+                sio_trace_idx = (int)(sio_trace_seq % SIO_TRACE_CAP);
+                sio_trace_first = sio_trace_seq;
+            }
+        }
+        if (sio_trace_buf) {
         SioTraceEntry *e = &sio_trace_buf[sio_trace_idx];
         e->seq           = sio_trace_seq;
         e->tx            = tx_byte;
@@ -2101,6 +2150,7 @@ static void sio_process_byte(uint8_t tx_byte) {
         e->slot0_state = (uint8_t)mc_slots[0].state;
         e->slot1_state = (uint8_t)mc_slots[1].state;
         sio_trace_idx = (sio_trace_idx + 1) % SIO_TRACE_CAP;
+        }
         sio_trace_seq++;
     }
 }
@@ -2680,6 +2730,14 @@ static void sio_fire_ack_irq(void) {
 
     extern uint32_t g_debug_current_func_addr;
     extern uint8_t psx_read_byte(uint32_t addr);
+    if (sio_rings_on() && !sio_irq_buf) {   /* diag2: lazy ring */
+        sio_irq_buf = (SioIrqEntry *)calloc(SIO_IRQ_RING_CAP, sizeof(SioIrqEntry));
+        if (sio_irq_buf) {
+            sio_irq_idx = (int)(sio_irq_seq % SIO_IRQ_RING_CAP);
+            sio_irq_first = sio_irq_seq;
+        }
+    }
+    if (sio_irq_buf) {
     SioIrqEntry *e = &sio_irq_buf[sio_irq_idx];
     e->seq            = sio_irq_seq;
     e->byte_seq       = sio_irq_pending_byte_seq;
@@ -2694,6 +2752,7 @@ static void sio_fire_ack_irq(void) {
     e->slot           = sio_irq_pending_slot;
     e->delay_applied  = sio_irq_pending_delay;
     sio_irq_idx = (sio_irq_idx + 1) % SIO_IRQ_RING_CAP;
+    }
     sio_irq_seq++;
     s_pace_ack_fires++;
     if (!sio_shift_active && !sio_tx_buffered && !sio_pending_ack) {
@@ -2849,6 +2908,15 @@ void sio_tick(int cycles) {
             /* SIO IRQ ring capture. */
             extern uint32_t g_debug_current_func_addr;
             extern uint8_t psx_read_byte(uint32_t addr);
+            if (sio_rings_on() && !sio_irq_buf) {   /* diag2: lazy ring */
+                sio_irq_buf = (SioIrqEntry *)calloc(SIO_IRQ_RING_CAP,
+                                                    sizeof(SioIrqEntry));
+                if (sio_irq_buf) {
+                    sio_irq_idx = (int)(sio_irq_seq % SIO_IRQ_RING_CAP);
+                    sio_irq_first = sio_irq_seq;
+                }
+            }
+            if (sio_irq_buf) {
             SioIrqEntry *e = &sio_irq_buf[sio_irq_idx];
             e->seq            = sio_irq_seq;
             e->byte_seq       = sio_irq_pending_byte_seq;
@@ -2863,6 +2931,7 @@ void sio_tick(int cycles) {
             e->slot           = sio_irq_pending_slot;
             e->delay_applied  = sio_irq_pending_delay;
             sio_irq_idx = (sio_irq_idx + 1) % SIO_IRQ_RING_CAP;
+            }
             sio_irq_seq++;
         }
     }

@@ -95,6 +95,13 @@ typedef struct {
 
 void audio_trace_init(void);
 
+/* diag2: arm (1) the PCM + event history rings, or leave them off (0).
+ * Default off: counters still run, but no 64 MiB PCM / 32 MiB event BSS.
+ * PSX_AUDIO_TAPS=1 / PSX_AUDIO_HISTORY=1 / PSX_DEBUG_HEAVY=1 arm at boot;
+ * any audio_* debug command arms on first use. */
+int audio_trace_arm_rings(int on);
+int audio_trace_rings_armed(void);
+
 /* Record `frames` interleaved stereo s16 frames into tap `tap`. */
 void audio_trace_pcm(int tap, const int16_t *stereo, int frames);
 

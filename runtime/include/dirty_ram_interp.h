@@ -400,8 +400,12 @@ typedef struct {
     uint32_t sp;        /* cpu->gpr[29] at dispatch */
     uint32_t frame;     /* s_frame_count at the time of dispatch */
 } DirtyRamBlockLogEntry;
-extern DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP];
-extern uint64_t              g_dirty_ram_block_log_seq;
+/* diag2: forensic rings are pointers allocated by the ensure_*() below on the
+ * first record (armed debug logging), not 224/3/7 MiB of committed BSS at
+ * every launch. Readers must handle NULL (nothing was ever recorded). */
+extern DirtyRamBlockLogEntry *g_dirty_ram_block_log;
+extern uint64_t               g_dirty_ram_block_log_seq;
+DirtyRamBlockLogEntry *dirty_ram_block_log_ensure(void);
 
 #ifdef PSX_NO_DEBUG_TOOLS
 #define DIRTY_RAM_FLOW_LOG_CAP 1u
@@ -420,8 +424,9 @@ typedef struct {
     uint32_t sp;
     uint32_t frame;
 } DirtyRamFlowLogEntry;
-extern DirtyRamFlowLogEntry g_dirty_ram_flow_log[DIRTY_RAM_FLOW_LOG_CAP];
-extern uint64_t             g_dirty_ram_flow_log_seq;
+extern DirtyRamFlowLogEntry *g_dirty_ram_flow_log;
+extern uint64_t              g_dirty_ram_flow_log_seq;
+DirtyRamFlowLogEntry *dirty_ram_flow_log_ensure(void);
 
 #ifdef PSX_NO_DEBUG_TOOLS
 #define DIRTY_RAM_INSN_LOG_CAP 1u
@@ -463,8 +468,9 @@ typedef struct {
     uint8_t  transferred;
     uint8_t  pad[3];
 } DirtyRamInsnLogEntry;
-extern DirtyRamInsnLogEntry g_dirty_ram_insn_log[DIRTY_RAM_INSN_LOG_CAP];
-extern uint64_t             g_dirty_ram_insn_log_seq;
+extern DirtyRamInsnLogEntry *g_dirty_ram_insn_log;
+extern uint64_t              g_dirty_ram_insn_log_seq;
+DirtyRamInsnLogEntry *dirty_ram_insn_log_ensure(void);
 
 #ifdef __cplusplus
 }

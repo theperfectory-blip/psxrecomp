@@ -184,6 +184,9 @@ void debug_server_diag_heavy_set(int on) {
     g_psx_diag_present = on ? 1 : 0;
     g_psx_diag_gte     = on ? 1 : 0;
     g_psx_diag_interp  = on ? 1 : 0;
+    /* diag2: audio PCM/event history rings follow the master switch. */
+    { extern int audio_trace_arm_rings(int on);
+      audio_trace_arm_rings(on ? 1 : 0); }
 }
 
 int debug_server_diag_heavy_get(void) {
@@ -293,7 +296,7 @@ static void fp_snapshot(uint32_t frame)
 #define REC_KIND_MMIO_R  3   /* device-register read  */
 #define REC_KIND_RAM_R   4   /* main-RAM read (targeted watch range only) */
 typedef struct { uint8_t kind; uint32_t addr; uint32_t val; uint32_t pc; uint32_t ra; uint64_t cyc; } RecEntry;
-static PSX_BSS RecEntry  s_rec_buf[REC_CAP];
+static RecEntry *s_rec_buf = NULL;   /* diag2: lazy 12 MiB one-frame recorder */
 static uint32_t  s_rec_count = 0;
 static int64_t   s_rec_frame = -1;       /* target guest frame, -1 = off */
 static uint32_t  s_rec_overflow = 0;
@@ -313,7 +316,11 @@ static inline void rec_event(uint8_t kind, uint32_t addr, uint32_t val,
 {
     if (s_rec_frame < 0 || (int64_t)s_frame_count != s_rec_frame) return;
     if (s_rec_count >= REC_CAP) { s_rec_overflow++; return; }
-    RecEntry *e = &s_rec_buf[s_rec_count++];
+    RecEntry *e;
+    if (!s_rec_buf &&
+        !(s_rec_buf = (RecEntry *)calloc(REC_CAP, sizeof(RecEntry))))  /* diag2 */
+        return;
+    e = &s_rec_buf[s_rec_count++];
     e->kind = kind; e->addr = addr; e->val = val; e->pc = pc; e->ra = ra;
     { extern uint64_t psx_get_cycle_count(void); e->cyc = psx_get_cycle_count(); }
 }
@@ -560,7 +567,7 @@ typedef struct {
     uint8_t  width;         /* 1=byte, 2=half, 4=word */
     uint8_t  pad[3];
 } SioPcTraceEntry;
-static PSX_BSS SioPcTraceEntry s_sio_pc_trace[SIO_PC_TRACE_CAP];
+static SioPcTraceEntry *s_sio_pc_trace = NULL;   /* diag2: lazy 8 MiB ring */
 static uint64_t s_sio_pc_trace_seq = 0;
 
 /* Compact register sidecar for SIO_CTRL writes.  The broad SIO PC ring keeps
@@ -591,7 +598,7 @@ typedef struct {
     uint8_t  counter_7514;
     uint8_t  pad;
 } SioCtrlRegTraceEntry;
-static PSX_BSS SioCtrlRegTraceEntry s_sio_ctrl_reg_trace[SIO_CTRL_REG_TRACE_CAP];
+static SioCtrlRegTraceEntry *s_sio_ctrl_reg_trace = NULL;  /* diag2: lazy 5 MiB */
 static uint64_t s_sio_ctrl_reg_trace_seq = 0;
 
 /* RestoreState / exception longjmp trace.  This is intentionally compact:
@@ -626,8 +633,15 @@ typedef struct {
     uint8_t  in_exception;
     uint8_t  pad[3];
 } RestoreTraceEntry;
-static PSX_BSS RestoreTraceEntry s_restore_trace[RESTORE_TRACE_CAP];
+static RestoreTraceEntry *s_restore_trace = NULL;   /* diag2: lazy 6.5 MiB ring */
 static uint64_t s_restore_trace_seq = 0;
+
+static RestoreTraceEntry *restore_trace_ensure(void) {
+    if (!s_restore_trace)
+        s_restore_trace = (RestoreTraceEntry *)calloc(RESTORE_TRACE_CAP,
+                                                      sizeof(RestoreTraceEntry));
+    return s_restore_trace;
+}
 
 #define THREAD_TRACE_CAP (1 << 16)
 typedef struct {
@@ -675,7 +689,7 @@ typedef struct {
     uint8_t  in_exception;
     uint8_t  pad[3];
 } ThreadTraceEntry;
-static PSX_BSS ThreadTraceEntry s_thread_trace[THREAD_TRACE_CAP];
+static ThreadTraceEntry *s_thread_trace = NULL;   /* diag2: lazy 11 MiB ring */
 static uint64_t s_thread_trace_seq = 0;
 
 #define SREG_TRACE_CAP (1 << 18)
@@ -705,9 +719,16 @@ typedef struct {
     int valid;
 } SregLastEntry;
 
-static PSX_BSS SregTraceEntry s_sreg_trace[SREG_TRACE_CAP];
+static SregTraceEntry *s_sreg_trace = NULL;   /* diag2: lazy 36 MiB ring */
 static uint64_t s_sreg_trace_seq = 0;
 static SregLastEntry s_sreg_last[32];
+
+static SregTraceEntry *sreg_trace_ensure(void) {
+    if (!s_sreg_trace)
+        s_sreg_trace = (SregTraceEntry *)calloc(SREG_TRACE_CAP,
+                                                sizeof(SregTraceEntry));
+    return s_sreg_trace;
+}
 
 #define PROBE_TRACE_CAP (1 << 16)
 typedef struct {
@@ -732,8 +753,15 @@ typedef struct {
     uint8_t  in_exception;
     uint8_t  pad[3];
 } ProbeTraceEntry;
-static PSX_BSS ProbeTraceEntry s_probe_trace[PROBE_TRACE_CAP];
+static ProbeTraceEntry *s_probe_trace = NULL;   /* diag2: lazy 5 MiB ring */
 static uint64_t s_probe_trace_seq = 0;
+
+static ProbeTraceEntry *probe_trace_ensure(void) {
+    if (!s_probe_trace)
+        s_probe_trace = (ProbeTraceEntry *)calloc(PROBE_TRACE_CAP,
+                                                  sizeof(ProbeTraceEntry));
+    return s_probe_trace;
+}
 
 void debug_server_log_probe(uint32_t pc, CPUState *cpu)
 {
@@ -742,6 +770,7 @@ void debug_server_log_probe(uint32_t pc, CPUState *cpu)
     return;
 #else
     if (!cpu) return;
+    if (!probe_trace_ensure()) return;   /* diag2: lazy ring */
     ProbeTraceEntry *e = &s_probe_trace[s_probe_trace_seq % PROBE_TRACE_CAP];
     e->seq          = s_probe_trace_seq++;
     e->pc           = pc;
@@ -771,8 +800,9 @@ void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t 
     (void)kind; (void)target_pc; (void)jmp_val;
     return;
 #endif
-    RestoreTraceEntry *e =
-        &s_restore_trace[s_restore_trace_seq % RESTORE_TRACE_CAP];
+    RestoreTraceEntry *e;
+    if (!restore_trace_ensure()) return;   /* diag2: lazy ring */
+    e = &s_restore_trace[s_restore_trace_seq % RESTORE_TRACE_CAP];
     CPUState *cpu = s_cpu;
     e->seq           = s_restore_trace_seq++;
     e->kind          = kind;
@@ -915,6 +945,7 @@ static void sreg_trace_record(uint32_t func_addr)
         return;
     }
 
+    if (!sreg_trace_ensure()) return;   /* diag2: lazy ring */
     SregTraceEntry *e = &s_sreg_trace[s_sreg_trace_seq % SREG_TRACE_CAP];
     e->seq = s_sreg_trace_seq++;
     e->tcb = tcb;
@@ -958,6 +989,12 @@ void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
     return;
 #endif
     if (!cpu) return;
+    /* diag2: 11 MiB ring, armed by `thread_trace` / PSX_DEBUG_HEAVY. */
+    if (!g_psx_diag_call) return;
+    if (!s_thread_trace &&
+        !(s_thread_trace = (ThreadTraceEntry *)calloc(THREAD_TRACE_CAP,
+                                                      sizeof(ThreadTraceEntry))))
+        return;
     ThreadTraceEntry *e =
         &s_thread_trace[s_thread_trace_seq % THREAD_TRACE_CAP];
     uint32_t tcb_ptr_addr = trace_read_word(cpu, 0x00000108u);
@@ -1008,6 +1045,10 @@ void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
 
 static void debug_server_log_sio_ctrl_regs(uint32_t value, uint8_t width,
                                            uint32_t byte_seq) {
+    if (!s_sio_ctrl_reg_trace &&
+        !(s_sio_ctrl_reg_trace = (SioCtrlRegTraceEntry *)calloc(
+              SIO_CTRL_REG_TRACE_CAP, sizeof(SioCtrlRegTraceEntry))))  /* diag2 */
+        return;
     SioCtrlRegTraceEntry *e =
         &s_sio_ctrl_reg_trace[s_sio_ctrl_reg_trace_seq % SIO_CTRL_REG_TRACE_CAP];
     CPUState *cpu = s_cpu;
@@ -1039,6 +1080,12 @@ void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width) {
     (void)addr; (void)value; (void)width;
     return;
 #endif
+    /* diag2: 8 MiB ring, armed by the sio_* commands / PSX_SIO_TRACE. */
+    if (!g_psx_diag_store) return;
+    if (!s_sio_pc_trace &&
+        !(s_sio_pc_trace = (SioPcTraceEntry *)calloc(SIO_PC_TRACE_CAP,
+                                                     sizeof(SioPcTraceEntry))))
+        return;
     SioPcTraceEntry *e = &s_sio_pc_trace[s_sio_pc_trace_seq % SIO_PC_TRACE_CAP];
     uint32_t byte_seq = sio_get_seq();
     e->seq      = s_sio_pc_trace_seq++;
@@ -1328,7 +1375,7 @@ typedef struct {
     uint8_t  source; /* 0 = direct entry hook, 1 = dispatch hook */
     uint8_t  pad[3];
 } CardMgrTraceEntry;
-static PSX_BSS CardMgrTraceEntry s_card_mgr_trace[CARD_MGR_TRACE_CAP];
+static CardMgrTraceEntry *s_card_mgr_trace = NULL;  /* diag2: lazy 10 MiB ring */
 static uint64_t s_card_mgr_trace_seq = 0;
 
 /* Shadow call stack: tracks open call frames. */
@@ -1561,6 +1608,10 @@ static void card_mgr_trace_record(uint32_t func_addr, uint8_t source) {
         }
     }
 
+    if (!s_card_mgr_trace &&
+        !(s_card_mgr_trace = (CardMgrTraceEntry *)calloc(
+              CARD_MGR_TRACE_CAP, sizeof(CardMgrTraceEntry))))   /* diag2 */
+        return;
     CardMgrTraceEntry *e = &s_card_mgr_trace[s_card_mgr_trace_seq % CARD_MGR_TRACE_CAP];
     e->seq       = s_card_mgr_trace_seq++;
     e->func_addr = phys;
@@ -1695,8 +1746,15 @@ static uint32_t call_focus_object_ptr(uint32_t func, CPUState *cpu)
 static void call_focus_record(uint32_t func_addr)
 {
     CPUState *cpu = debug_cpu_ptr;
-    if (!s_call_focus || !cpu) return;
+    if (!cpu) return;
+    /* diag2: an always-on 208 MiB heap ring for a Tomba-specific address list;
+     * arm with `{"cmd":"call_focus",...}` (diag_arm_for_command) instead. */
+    if (!g_psx_diag_call) return;
     if (!call_focus_target(func_addr)) return;
+    if (!s_call_focus &&
+        !(s_call_focus = (CallFocusEntry *)calloc(CALL_FOCUS_CAP,
+                                                  sizeof(CallFocusEntry))))
+        return;   /* diag2: ~40 MiB heap ring, allocated on first focused call */
 
     CallFocusEntry *e = &s_call_focus[s_call_focus_seq % CALL_FOCUS_CAP];
     e->seq       = s_call_focus_seq++;
@@ -2851,7 +2909,7 @@ static int          s_fnp_npend = 0;
 static FnProbePend  s_fnp_pend[FNPROBE_PENDING];
 static uint8_t      s_fnp_entry_mark[FNPROBE_PHYS_WORDS];
 static uint16_t     s_fnp_ra_mark[FNPROBE_PHYS_WORDS];
-static FnProbeRec   s_fnp_ring[FNPROBE_CAP];
+static FnProbeRec  *s_fnp_ring = NULL;   /* diag2: lazy 12 MiB ring */
 
 static inline void fnprobe_observe(uint32_t phys)
 {
@@ -2867,6 +2925,10 @@ static inline void fnprobe_observe(uint32_t phys)
             s_fnp_pend[i] = s_fnp_pend[--s_fnp_npend];
             s_fnp_ra_mark[w]--;
             if (s_fnp_seq < s_fnp_max) {
+                if (!s_fnp_ring &&
+                    !(s_fnp_ring = (FnProbeRec *)calloc(FNPROBE_CAP,
+                                                        sizeof(FnProbeRec))))
+                    break;   /* diag2: lazy ring */
                 FnProbeRec *r = &s_fnp_ring[s_fnp_seq % FNPROBE_CAP];
                 r->seq   = s_fnp_seq++;
                 r->fn    = s_fnp_fn[p.fi];
@@ -3411,7 +3473,7 @@ static void handle_dirty_block_log(int id, const char *json)
     if (count < 1) count = 1;
     if (count > (int)DIRTY_RAM_BLOCK_LOG_CAP) count = DIRTY_RAM_BLOCK_LOG_CAP;
 
-    uint64_t total = g_dirty_ram_block_log_seq;
+    uint64_t total = g_dirty_ram_block_log ? g_dirty_ram_block_log_seq : 0; /* diag2: lazy ring */
     uint64_t avail = (total < DIRTY_RAM_BLOCK_LOG_CAP) ? total : DIRTY_RAM_BLOCK_LOG_CAP;
     uint64_t scan_start = (total > avail) ? (total - avail) : 0;
 
@@ -3464,7 +3526,7 @@ static void handle_dirty_flow_log(int id, const char *json)
     if (count < 1) count = 1;
     if (count > (int)DIRTY_RAM_FLOW_LOG_CAP) count = DIRTY_RAM_FLOW_LOG_CAP;
 
-    uint64_t total = g_dirty_ram_flow_log_seq;
+    uint64_t total = g_dirty_ram_flow_log ? g_dirty_ram_flow_log_seq : 0; /* diag2: lazy ring */
     uint64_t avail = (total < DIRTY_RAM_FLOW_LOG_CAP) ? total : DIRTY_RAM_FLOW_LOG_CAP;
     const size_t BUF_SZ = 2 * 1024 * 1024;
     char *out = (char *)malloc(BUF_SZ);
@@ -3574,7 +3636,7 @@ static void handle_dirty_block_dump_file(int id, const char *json)
         snprintf(path, sizeof(path), "dirty_block_log.json");
     FILE *f = fopen(path, "w");
     if (!f) { send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"open failed\"}\n", id); return; }
-    uint64_t total = g_dirty_ram_block_log_seq;
+    uint64_t total = g_dirty_ram_block_log ? g_dirty_ram_block_log_seq : 0; /* diag2: lazy ring */
     uint64_t avail = (total < DIRTY_RAM_BLOCK_LOG_CAP) ? total : DIRTY_RAM_BLOCK_LOG_CAP;
     fputc('[', f);
     int first = 1, count = 0;
@@ -3609,7 +3671,7 @@ static void handle_dirty_insn_dump_file(int id, const char *json)
         snprintf(path, sizeof(path), "dirty_insn_log.json");
     FILE *f = fopen(path, "w");
     if (!f) { send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"open failed\"}\n", id); return; }
-    uint64_t total = g_dirty_ram_insn_log_seq;
+    uint64_t total = g_dirty_ram_insn_log ? g_dirty_ram_insn_log_seq : 0; /* diag2: lazy ring */
     uint64_t avail = (total < DIRTY_RAM_INSN_LOG_CAP) ? total : DIRTY_RAM_INSN_LOG_CAP;
     fputc('[', f);
     int first = 1, count = 0;
@@ -3862,7 +3924,7 @@ static void handle_fntrace_dump(int id, const char *json)
     if (count < 1) count = 1;
     if (count > (int)FNTRACE_RING_CAP) count = FNTRACE_RING_CAP;
 
-    uint64_t total = g_fntrace_seq;
+    uint64_t total = g_fntrace_ring ? g_fntrace_seq : 0;   /* diag2: lazy ring */
     uint64_t avail = (total < FNTRACE_RING_CAP) ? total : FNTRACE_RING_CAP;
     uint64_t oldest = total - avail;
     if (have_seq_window) {
@@ -4028,6 +4090,8 @@ static void handle_bios_info(int id, const char *json)
  * Optional filters: "fn":N (t1 index), "route":0|1|2. */
 static void handle_hle_dump(int id, const char *json)
 {
+    extern int psx_hle_ring_arm(int on);
+    psx_hle_ring_arm(1);        /* diag2: arm the lazy ring */
     int  tail       = json_get_int(json, "tail", 0);
     long want_fn    = json_get_int(json, "fn", -1);
     long want_route = json_get_int(json, "route", -1);
@@ -4344,7 +4408,9 @@ static void handle_sio_ctrl_reg_window(int id, const char *json)
 static void handle_sio_ctrl_reg_clear(int id, const char *json)
 {
     (void)json;
-    memset(s_sio_ctrl_reg_trace, 0, sizeof(s_sio_ctrl_reg_trace));
+    if (s_sio_ctrl_reg_trace)   /* diag2: lazy ring */
+        memset(s_sio_ctrl_reg_trace, 0,
+               (size_t)SIO_CTRL_REG_TRACE_CAP * sizeof(SioCtrlRegTraceEntry));
     s_sio_ctrl_reg_trace_seq = 0;
     send_ok(id);
 }
@@ -4472,7 +4538,8 @@ static void handle_restore_trace_window(int id, const char *json)
 static void handle_restore_trace_clear(int id, const char *json)
 {
     (void)json;
-    memset(s_restore_trace, 0, sizeof(s_restore_trace));
+    if (s_restore_trace)
+        memset(s_restore_trace, 0, (size_t)RESTORE_TRACE_CAP * sizeof(RestoreTraceEntry));
     s_restore_trace_seq = 0;
     send_ok(id);
 }
@@ -4711,7 +4778,8 @@ static void handle_thread_trace(int id, const char *json)
 static void handle_thread_trace_clear(int id, const char *json)
 {
     (void)json;
-    memset(s_thread_trace, 0, sizeof(s_thread_trace));
+    if (s_thread_trace)   /* diag2: lazy ring */
+        memset(s_thread_trace, 0, (size_t)THREAD_TRACE_CAP * sizeof(ThreadTraceEntry));
     s_thread_trace_seq = 0;
     send_ok(id);
 }
@@ -4730,7 +4798,8 @@ static void handle_sreg_trace_stats(int id, const char *json)
 static void handle_sreg_trace_clear(int id, const char *json)
 {
     (void)json;
-    memset(s_sreg_trace, 0, sizeof(s_sreg_trace));
+    if (s_sreg_trace)
+        memset(s_sreg_trace, 0, (size_t)SREG_TRACE_CAP * sizeof(SregTraceEntry));
     memset(s_sreg_last, 0, sizeof(s_sreg_last));
     s_sreg_trace_seq = 0;
     send_ok(id);
@@ -5027,7 +5096,8 @@ static void handle_probe_trace(int id, const char *json)
 static void handle_probe_clear(int id, const char *json)
 {
     (void)json;
-    memset(s_probe_trace, 0, sizeof(s_probe_trace));
+    if (s_probe_trace)   /* diag2: lazy ring */
+        memset(s_probe_trace, 0, (size_t)PROBE_TRACE_CAP * sizeof(ProbeTraceEntry));
     s_probe_trace_seq = 0;
     send_ok(id);
 }
@@ -7479,6 +7549,8 @@ static void handle_spu_ram(int id, const char *json)
  * (KEYON / KEYOFF / END_STOP / END_LOOP / IRQ) with frame timestamps. */
 static void handle_spu_events(int id, const char *json)
 {
+    extern int spu_event_arm(int on);
+    spu_event_arm(1);           /* diag2: arm the lazy event ring */
     int count = json_get_int(json, "count", 256);
     if (count < 1) count = 1;
     if (count > 4096) count = 4096;
@@ -7549,6 +7621,7 @@ extern int psx_audio_out_stats(double *fill_ms, double *target_ms,
 static void handle_audio_stats(int id, const char *json)
 {
     (void)json;
+    audio_trace_arm_rings(1);   /* diag2: history rings arm on first audio_* use */
     AudioTraceStats st;
     audio_trace_get_stats(&st);
     double fill_ms = 0.0, target_ms = 0.0, correction = 0.0;
@@ -7604,6 +7677,7 @@ static void handle_audio_stats(int id, const char *json)
 
 static void handle_audio_wav(int id, const char *json)
 {
+    audio_trace_arm_rings(1);   /* diag2: arm; history starts now if it was off */
     char path[512];
     if (!json_get_str(json, "path", path, sizeof(path))) {
         send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"missing path\"}", id);
@@ -7637,6 +7711,7 @@ static void handle_audio_wav(int id, const char *json)
 
 static void handle_audio_events(int id, const char *json)
 {
+    audio_trace_arm_rings(1);   /* diag2: arm; events recorded from now on */
     int count = json_get_int(json, "count", 256);
     if (count < 1) count = 1;
     if (count > 8192) count = 8192;
@@ -7899,11 +7974,20 @@ static void handle_sio_trace(int id, const char *json)
 
     const SioTraceEntry *buf;
     int write_idx;
+    sio_rings_arm(1);           /* diag2: arm the lazy ring */
     uint32_t total_seq = sio_get_trace(&buf, &write_idx);
+    if (!buf) {
+        /* Armed but no SIO byte has been traced yet (allocated on first byte). */
+        send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"total\":%u,\"count\":0,"
+                 "\"entries\":[]}\n", id, (unsigned)total_seq);
+        return;
+    }
 
     /* How many entries are actually available? */
-    int avail = (int)(total_seq < (uint32_t)SIO_TRACE_CAP ? total_seq : SIO_TRACE_CAP);
-    if (count > avail) count = avail;
+    uint32_t first_seq = sio_trace_first_seq();   /* diag2: arming point */
+    uint32_t stored = total_seq - first_seq;
+    uint32_t avail = stored < (uint32_t)SIO_TRACE_CAP ? stored : (uint32_t)SIO_TRACE_CAP;
+    if ((uint32_t)count > avail) count = (int)avail;
 
     /* Start reading from (write_idx - count) wrapped */
     int start = (write_idx - count + SIO_TRACE_CAP) % SIO_TRACE_CAP;
@@ -7945,10 +8029,19 @@ static void handle_sio_trace_window(int id, const char *json)
 
     const SioTraceEntry *buf;
     int write_idx;
+    sio_rings_arm(1);           /* diag2: arm the lazy ring */
     uint32_t total_seq = sio_get_trace(&buf, &write_idx);
     (void)write_idx;
+    if (!buf) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"total\":%u,"
+                 "\"oldest\":0,\"seq\":%d,\"entries\":[],\"emitted\":0}\n",
+                 id, (unsigned)total_seq, seq);
+        return;
+    }
+    uint32_t first_seq = sio_trace_first_seq();   /* diag2: arming point */
     uint32_t oldest = (total_seq > (uint32_t)SIO_TRACE_CAP)
                     ? total_seq - (uint32_t)SIO_TRACE_CAP : 0;
+    if (oldest < first_seq) oldest = first_seq;
     uint32_t lo = (uint32_t)((seq > before) ? (seq - before) : 0);
     uint32_t hi = (uint32_t)(seq + after);
     if (lo < oldest) lo = oldest;
@@ -8166,10 +8259,19 @@ static void handle_sio_irq_dump(int id, const char *json)
 
     const SioIrqEntry *buf;
     int write_idx;
+    sio_rings_arm(1);           /* diag2: arm the lazy ring */
     uint32_t total_seq = sio_get_irq_ring(&buf, &write_idx);
+    if (!buf) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"total\":%u,\"shown\":0,"
+                 "\"src_filter\":%d,\"entries\":[],\"emitted\":0}\n",
+                 id, (unsigned)total_seq, src_filter);
+        return;
+    }
 
-    int avail = (int)(total_seq < (uint32_t)SIO_IRQ_RING_CAP
-                      ? total_seq : SIO_IRQ_RING_CAP);
+    uint32_t first_seq = sio_irq_first_seq();   /* diag2: arming point */
+    uint32_t stored = total_seq - first_seq;
+    int avail = (int)(stored < (uint32_t)SIO_IRQ_RING_CAP
+                      ? stored : SIO_IRQ_RING_CAP);
     if (count > avail) count = avail;
 
     int start = (write_idx - count + SIO_IRQ_RING_CAP) % SIO_IRQ_RING_CAP;
@@ -8214,10 +8316,20 @@ static void handle_sio_irq_window(int id, const char *json)
     uint32_t hi = (uint32_t)(byte_seq + after);
     const SioIrqEntry *buf;
     int write_idx;
+    sio_rings_arm(1);           /* diag2: arm the lazy ring */
     uint32_t total_seq = sio_get_irq_ring(&buf, &write_idx);
     (void)write_idx;
+    if (!buf) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"total\":%u,"
+                 "\"available\":0,\"byte_seq\":%d,\"src_filter\":%d,"
+                 "\"entries\":[],\"emitted\":0}\n",
+                 id, (unsigned)total_seq, byte_seq, src_filter);
+        return;
+    }
+    uint32_t first_seq = sio_irq_first_seq();   /* diag2: arming point */
     uint32_t avail = (total_seq < (uint32_t)SIO_IRQ_RING_CAP)
                    ? total_seq : (uint32_t)SIO_IRQ_RING_CAP;
+    if (avail > total_seq - first_seq) avail = total_seq - first_seq;
     uint32_t start = total_seq - avail;
 
     send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"available\":%u,"
@@ -8255,10 +8367,18 @@ static void handle_card_txn_dump(int id, const char *json)
 
     const SioTxnEntry *buf;
     int write_idx, open_flag;
+    sio_rings_arm(1);           /* diag2: arm the lazy ring */
     uint32_t total_seq = sio_get_card_txns(&buf, &write_idx, &open_flag);
+    if (!buf) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"total_closed\":%u,"
+                 "\"open\":%s,\"slot_filter\":%d,\"count\":0,\"entries\":[]}\n",
+                 id, (unsigned)total_seq, open_flag ? "true" : "false", slot);
+        return;
+    }
 
-    int avail = (int)(total_seq < (uint32_t)SIO_TXN_CAP
-                      ? total_seq : SIO_TXN_CAP);
+    uint32_t first_seq = sio_txn_first_seq();   /* diag2: arming point */
+    uint32_t stored = total_seq - first_seq;
+    int avail = (int)(stored < (uint32_t)SIO_TXN_CAP ? stored : SIO_TXN_CAP);
     if (count > avail) count = avail;
 
     int start = (write_idx - count + SIO_TXN_CAP) % SIO_TXN_CAP;
@@ -14097,7 +14217,8 @@ static void handle_card_mgr_trace(int id, const char *json) {
 static void handle_card_mgr_clear(int id, const char *json) {
     (void)json;
     s_card_mgr_trace_seq = 0;
-    memset(s_card_mgr_trace, 0, sizeof(s_card_mgr_trace));
+    if (s_card_mgr_trace)
+        memset(s_card_mgr_trace, 0, (size_t)CARD_MGR_TRACE_CAP * sizeof(CardMgrTraceEntry));
     send_ok(id);
 }
 
@@ -15750,7 +15871,7 @@ void debug_server_freeze_dump_dirty_block_json(FILE *f, uint32_t max_count)
 {
     if (!f) { return; }
 
-    uint64_t total = g_dirty_ram_block_log_seq;
+    uint64_t total = g_dirty_ram_block_log ? g_dirty_ram_block_log_seq : 0; /* diag2: lazy ring */
     uint64_t avail = (total < (uint64_t)DIRTY_RAM_BLOCK_LOG_CAP)
                      ? total : (uint64_t)DIRTY_RAM_BLOCK_LOG_CAP;
     uint64_t want  = ((uint64_t)max_count < avail) ? (uint64_t)max_count : avail;
@@ -16142,6 +16263,8 @@ static void handle_phase_profile(int id, const char *json)
  * shares of guest CPU time, including idle-skipped waits. */
 static void handle_gcp_ring(int id, const char *json)
 {
+    extern int guest_cycle_profile_arm(int on);
+    guest_cycle_profile_arm(1);   /* diag2: arm the lazy 20 MiB sample ring */
     const uint64_t total = guest_cycle_profile_total();
     const uint64_t oldest = guest_cycle_profile_oldest();
     GcpSample first, last;
@@ -17237,10 +17360,8 @@ void debug_server_init(int port)
     s_fn_trace_filter_hi = 0xFFFFFFFFu;
     fn_trace_filter_from_env("PSX_FN_FILTER");
 
-    if (!s_call_focus) {
-        s_call_focus = (CallFocusEntry *)calloc(CALL_FOCUS_CAP,
-                                                sizeof(CallFocusEntry));
-    }
+    /* diag2: s_call_focus (~40 MiB) is allocated by call_focus_record on the
+     * first focused call instead of at boot. */
     s_call_focus_seq = 0;
 
     /* PGXP rings stamp each record with the store PC and frame. */

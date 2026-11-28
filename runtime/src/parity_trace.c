@@ -3,16 +3,25 @@
  * compiles into both psx-runtime and psx-beetle and they emit identical rows. */
 #include "parity_trace.h"
 #include "psx_bss.h"
+#include <stdlib.h>
 #include <string.h>
 
 #define PARITY_RING_CAP 131072u  /* power of two; ~128K thread1 events of history
                                   * so the parked-thread1 divergence is in-window,
                                   * not just the wedge tail (~7.5 MB ring). */
 
-static PSX_BSS ParityEntry s_ring[PARITY_RING_CAP];
+/* diag2: both rings are heap-allocated on first armed record (they used to be
+ * ~25 MiB + ~7.5 MiB of committed BSS at every launch). */
+static ParityEntry *s_ring  = NULL;
 static uint64_t    s_seq      = 0;
 static uint32_t    s_armed    = 0;
 static uint32_t    s_frozen   = 0;
+
+static ParityEntry *parity_ring_ensure(void) {
+    if (!s_ring)
+        s_ring = (ParityEntry *)calloc(PARITY_RING_CAP, sizeof(ParityEntry));
+    return s_ring;
+}
 
 static uint32_t    s_watched_tcb   = 0;
 static uint32_t    s_trigger       = 0;
@@ -33,8 +42,14 @@ static uint32_t    s_last_current_tcb = 0; /* writer-TCB attribution for note_wr
  * Each row carries reader provenance (pc/cycle/frame + addr in epc, value in target
  * & the matched watch slot) AND the current last-WRITER metadata for that slot, so
  * a single read row answers "who read what value, that whom last wrote". */
-static PSX_BSS ParityEntry s_rring[PARITY_RING_CAP];
+static ParityEntry *s_rring = NULL;   /* diag2: lazy */
 static uint64_t    s_rseq = 0;
+
+static ParityEntry *parity_rring_ensure(void) {
+    if (!s_rring)
+        s_rring = (ParityEntry *)calloc(PARITY_RING_CAP, sizeof(ParityEntry));
+    return s_rring;
+}
 
 /* Frame + guest-cycle stamps: each host process defines these accessors
  * (decoupled so this single TU compiles into both). cycle = absolute guest CPU
@@ -62,8 +77,10 @@ void parity_trace_config(uint32_t watched_tcb, uint32_t trigger_target,
 
 void parity_trace_arm(int on)        { s_armed = on ? 1u : 0u; }
 void parity_trace_reset(void)        {
-    s_seq = 0; s_frozen = 0; memset(s_ring, 0, sizeof(s_ring));
-    s_rseq = 0; memset(s_rring, 0, sizeof(s_rring));
+    s_seq = 0; s_frozen = 0;
+    if (s_ring) memset(s_ring, 0, (size_t)PARITY_RING_CAP * sizeof(ParityEntry));
+    s_rseq = 0;
+    if (s_rring) memset(s_rring, 0, (size_t)PARITY_RING_CAP * sizeof(ParityEntry));
     for (int i = 0; i < PARITY_WATCH_MAX; i++) {
         s_wpc[i] = 0; s_wcycle[i] = 0; s_wframe[i] = 0; s_wtcb[i] = 0;
     }
@@ -103,6 +120,7 @@ void parity_trace_record(parity_kind_t kind, uint32_t pc, uint32_t ra,
 
     if (s_watched_tcb && current_tcb != s_watched_tcb) return;
 
+    if (!parity_ring_ensure()) return;   /* diag2: lazy ring */
     ParityEntry* e = &s_ring[s_seq & (PARITY_RING_CAP - 1u)];
     e->seq         = s_seq;
     e->frame       = parity_host_frame();
@@ -158,6 +176,7 @@ void parity_trace_note_read(uint32_t addr, uint32_t value, uint32_t reader_pc)
         if (!s_watch[i]) continue;
         uint32_t wa = s_watch[i] & 0x1FFFFFFFu;   /* watch word occupies [wa, wa+4) */
         if (pa < wa + 4u && pa + 4u > wa) {
+            if (!parity_rring_ensure()) return;   /* diag2: lazy ring */
             ParityEntry* e = &s_rring[s_rseq & (PARITY_RING_CAP - 1u)];
             memset(e, 0, sizeof(*e));
             e->seq    = s_rseq;
@@ -183,7 +202,7 @@ void parity_trace_note_read(uint32_t addr, uint32_t value, uint32_t reader_pc)
 
 uint32_t parity_trace_get(ParityEntry* out, uint32_t max_rows)
 {
-    if (!out || max_rows == 0) return 0;
+    if (!out || max_rows == 0 || !s_ring) return 0;
     uint64_t total = s_seq;
     uint32_t avail = (total < PARITY_RING_CAP) ? (uint32_t)total : PARITY_RING_CAP;
     uint32_t n = (avail < max_rows) ? avail : max_rows;
@@ -197,7 +216,7 @@ uint64_t parity_trace_reads_total(void) { return s_rseq; }
 
 uint32_t parity_trace_reads_get(ParityEntry* out, uint32_t max_rows)
 {
-    if (!out || max_rows == 0) return 0;
+    if (!out || max_rows == 0 || !s_rring) return 0;
     uint64_t total = s_rseq;
     uint32_t avail = (total < PARITY_RING_CAP) ? (uint32_t)total : PARITY_RING_CAP;
     uint32_t n = (avail < max_rows) ? avail : max_rows;

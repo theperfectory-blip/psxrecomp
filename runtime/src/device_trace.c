@@ -2,15 +2,22 @@
  * See device_trace.h. Self-contained (no runtime internals) so the SAME TU
  * compiles into both psx-runtime and psx-beetle and they emit identical rows. */
 #include "device_trace.h"
+#include <stdlib.h>
 #include <string.h>
 
 #define DEVTRACE_RING_CAP (1u << 20)  /* 1M events (~24 MB); covers the whole
                                        * boot->wedge window so the divergent
                                        * event is in-window, never evicted. */
 
-static DevEvent  s_ring[DEVTRACE_RING_CAP];
+static DevEvent *s_ring  = NULL;   /* diag2: heap ring, allocated on first arm */
 static uint64_t  s_seq   = 0;
 static uint32_t  s_armed = 0;
+
+static DevEvent *devtrace_ensure(void) {
+    if (!s_ring)
+        s_ring = (DevEvent *)calloc(DEVTRACE_RING_CAP, sizeof(DevEvent));
+    return s_ring;
+}
 
 /* Guest-cycle + frame accessors — the SAME the parity ring uses, defined once
  * per host process (native: main.cpp; Beetle: beetle_libretro.cpp). Reused so
@@ -18,8 +25,8 @@ static uint32_t  s_armed = 0;
 extern uint32_t parity_host_frame(void);
 extern uint64_t parity_host_cycle(void);
 
-void device_trace_arm(int on)     { s_armed = on ? 1u : 0u; }
-void device_trace_reset(void)     { s_seq = 0; memset(s_ring, 0, sizeof(s_ring)); }
+void device_trace_arm(int on)     { s_armed = on ? 1u : 0u; if (s_armed) (void)devtrace_ensure(); }
+void device_trace_reset(void)     { s_seq = 0; if (s_ring) memset(s_ring, 0, (size_t)DEVTRACE_RING_CAP * sizeof(DevEvent)); }
 int  device_trace_is_armed(void)  { return (int)s_armed; }
 uint64_t device_trace_total(void) { return s_seq; }
 
@@ -43,7 +50,7 @@ const char* device_source_str(uint32_t source)
 
 void device_trace_note(uint32_t source, uint32_t detail)
 {
-    if (!s_armed) return;
+    if (!s_armed || !devtrace_ensure()) return;
     DevEvent* e = &s_ring[s_seq & (DEVTRACE_RING_CAP - 1u)];
     e->seq    = s_seq;
     e->cycle  = parity_host_cycle();
@@ -55,7 +62,7 @@ void device_trace_note(uint32_t source, uint32_t detail)
 
 uint32_t device_trace_get(DevEvent* out, uint32_t max_rows)
 {
-    if (!out || max_rows == 0) return 0;
+    if (!out || max_rows == 0 || !s_ring) return 0;
     uint64_t total = s_seq;
     uint32_t avail = (total < DEVTRACE_RING_CAP) ? (uint32_t)total : DEVTRACE_RING_CAP;
     uint32_t n = (avail < max_rows) ? avail : max_rows;

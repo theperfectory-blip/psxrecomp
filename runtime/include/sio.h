@@ -248,8 +248,17 @@ typedef struct {
 } SioTraceEntry;
 
 /* Get pointer to ring buffer and current write index.
- * Returns number of entries ever written (seq of next write). */
+ * Returns number of entries ever written (seq of next write).
+ * diag2: the ring is NULL until armed (see sio_rings_arm). */
 uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out);
+
+/* diag2: SIO forensic rings are opt-in (~102 MiB of BSS otherwise). */
+int sio_rings_arm(int on);
+int sio_rings_armed(void);
+/* First seq actually present in each ring (0 when never armed). */
+uint32_t sio_trace_first_seq(void);
+uint32_t sio_irq_first_seq(void);
+uint32_t sio_txn_first_seq(void);
 
 /* Current SIO byte sequence — used by SIO PC tracer for cross-referencing. */
 uint32_t sio_get_seq(void);

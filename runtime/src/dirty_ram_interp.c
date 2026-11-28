@@ -229,12 +229,33 @@ uint32_t g_dirty_ram_dispatch_pc_bitmap[DIRTY_RAM_EXEC_BITMAP_WORDS] = {0};
 uint32_t g_dirty_ram_dispatch_seg_bitmap[PSX_CODE_SEGMENT_COUNT]
                                         [DIRTY_RAM_EXEC_BITMAP_WORDS] = {{0}};
 
-DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP] = {0};
-uint64_t              g_dirty_ram_block_log_seq = 0;
-DirtyRamFlowLogEntry  g_dirty_ram_flow_log[DIRTY_RAM_FLOW_LOG_CAP] = {0};
-uint64_t              g_dirty_ram_flow_log_seq = 0;
-DirtyRamInsnLogEntry  g_dirty_ram_insn_log[DIRTY_RAM_INSN_LOG_CAP] = {0};
-uint64_t              g_dirty_ram_insn_log_seq = 0;
+/* diag2: lazy forensic rings. Allocated on the first armed record instead of
+ * committing 224 MiB (block) + 3 MiB (flow) + 7 MiB (insn) at every launch. */
+DirtyRamBlockLogEntry *g_dirty_ram_block_log = NULL;
+uint64_t               g_dirty_ram_block_log_seq = 0;
+DirtyRamFlowLogEntry  *g_dirty_ram_flow_log = NULL;
+uint64_t               g_dirty_ram_flow_log_seq = 0;
+DirtyRamInsnLogEntry  *g_dirty_ram_insn_log = NULL;
+uint64_t               g_dirty_ram_insn_log_seq = 0;
+
+DirtyRamBlockLogEntry *dirty_ram_block_log_ensure(void) {
+    if (!g_dirty_ram_block_log)
+        g_dirty_ram_block_log = (DirtyRamBlockLogEntry *)calloc(
+            DIRTY_RAM_BLOCK_LOG_CAP, sizeof(DirtyRamBlockLogEntry));
+    return g_dirty_ram_block_log;
+}
+DirtyRamFlowLogEntry *dirty_ram_flow_log_ensure(void) {
+    if (!g_dirty_ram_flow_log)
+        g_dirty_ram_flow_log = (DirtyRamFlowLogEntry *)calloc(
+            DIRTY_RAM_FLOW_LOG_CAP, sizeof(DirtyRamFlowLogEntry));
+    return g_dirty_ram_flow_log;
+}
+DirtyRamInsnLogEntry *dirty_ram_insn_log_ensure(void) {
+    if (!g_dirty_ram_insn_log)
+        g_dirty_ram_insn_log = (DirtyRamInsnLogEntry *)calloc(
+            DIRTY_RAM_INSN_LOG_CAP, sizeof(DirtyRamInsnLogEntry));
+    return g_dirty_ram_insn_log;
+}
 
 /* Current frame counter, defined in debug_server.c. */
 extern uint64_t s_frame_count;
@@ -705,6 +726,8 @@ static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
     extern volatile int g_psx_diag_interp;   /* diag1: ring ships disarmed */
     if (!g_psx_diag_interp) return;
     if (g_insn_log_frozen) return;
+    DirtyRamInsnLogEntry *log = dirty_ram_insn_log_ensure();   /* diag2: lazy */
+    if (!log) return;
     /* Freeze-on-target (Confirm-(b)): checked BEFORE the gate filter so it fires
      * for ANY interpreted instruction transferring to the watched wild PC, even
      * if that jr/jalr sits outside the recorded gate range. We do NOT record this
@@ -738,7 +761,7 @@ static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
 
     uint64_t s = g_dirty_ram_insn_log_seq++;
     DirtyRamInsnLogEntry *e =
-        &g_dirty_ram_insn_log[s & (DIRTY_RAM_INSN_LOG_CAP - 1u)];
+        &log[s & (DIRTY_RAM_INSN_LOG_CAP - 1u)];
     e->seq          = s;
     e->pc           = pc;
     e->insn         = insn;
@@ -775,9 +798,11 @@ void dirty_ram_log_marker(uint32_t addr, uint32_t tag, int kind) {
     extern volatile int g_psx_diag_interp;   /* diag1: ring ships disarmed */
     if (!g_psx_diag_interp) return;
     if (g_insn_log_frozen) return;
+    DirtyRamInsnLogEntry *log = dirty_ram_insn_log_ensure();   /* diag2: lazy */
+    if (!log) return;
     uint64_t s = g_dirty_ram_insn_log_seq++;
     DirtyRamInsnLogEntry *e =
-        &g_dirty_ram_insn_log[s & (DIRTY_RAM_INSN_LOG_CAP - 1u)];
+        &log[s & (DIRTY_RAM_INSN_LOG_CAP - 1u)];
     memset(e, 0, sizeof *e);
     e->seq         = s;
     e->pc          = addr;
@@ -3203,9 +3228,11 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * PSX_DIRTY_BLOCK_LOG=1 or any dirty_block/flow/insn command. */
     { extern volatile int g_psx_diag_interp;
       if (g_psx_diag_interp && !g_insn_log_frozen) {
+        DirtyRamBlockLogEntry *log = dirty_ram_block_log_ensure(); /* diag2 */
+        if (log) {
         uint64_t s = g_dirty_ram_block_log_seq++;
         DirtyRamBlockLogEntry *e =
-            &g_dirty_ram_block_log[s & (DIRTY_RAM_BLOCK_LOG_CAP - 1u)];
+            &log[s & (DIRTY_RAM_BLOCK_LOG_CAP - 1u)];
         e->seq    = s;
         e->target = addr;
         e->ra     = cpu->gpr[31];
@@ -3218,6 +3245,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         e->t2     = cpu->gpr[10];
         e->sp     = cpu->gpr[29];
         e->frame  = (uint32_t)s_frame_count;
+        }
       } }
 #endif
 
@@ -3542,9 +3570,11 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 /* Capture freeze gates ONLY the ring write — never flow. */
 #ifndef PSX_NO_DEBUG_TOOLS
                 if (!g_insn_log_frozen) {
+                    DirtyRamFlowLogEntry *log = dirty_ram_flow_log_ensure(); /* diag2 */
+                    if (log) {
                     uint64_t s = g_dirty_ram_flow_log_seq++;
                     DirtyRamFlowLogEntry *e =
-                        &g_dirty_ram_flow_log[s & (DIRTY_RAM_FLOW_LOG_CAP - 1u)];
+                        &log[s & (DIRTY_RAM_FLOW_LOG_CAP - 1u)];
                     e->seq = s;
                     e->pc = pc;
                     e->target = target;
@@ -3555,6 +3585,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                     e->a3 = cpu->gpr[7];
                     e->sp = cpu->gpr[29];
                     e->frame = (uint32_t)s_frame_count;
+                    }
                 }
 #endif
                 /* Local transfers bypass dispatch, but must retain the same

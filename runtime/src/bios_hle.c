@@ -39,6 +39,7 @@
 #include "psx_cycles.h"
 
 #include <stddef.h>
+#include <stdlib.h>   /* diag2: calloc/getenv for the lazy HLE call ring */
 
 /* fntrace.c — game-entry handoff latch (drives the boot turbo window). */
 extern int fntrace_is_game_started(void);
@@ -87,14 +88,41 @@ static int s_shell_skipped   = 0;   /* boot skip already fired */
  * delivery gives the callback, reused here so the dispatch return contract
  * matches. 0 = unknown for this BIOS: callback delivery stays LLE. */
 
-/* ── always-on ring ──────────────────────────────────────────────────────── */
+/* ── call ring (diag2: heap ring, armed on demand) ──────────────────────── */
 
-static PsxHleCallEntry s_ring[PSX_HLE_RING_CAP];
+static PsxHleCallEntry *s_ring = NULL;   /* diag2: was 32 MiB of BSS */
 static uint64_t        s_ring_seq = 0;
+static int             s_ring_on = -1;
+
+int psx_hle_ring_arm(int on)
+{
+    if (on) {
+        s_ring_on = 1;
+        if (!s_ring)
+            s_ring = (PsxHleCallEntry *)calloc(PSX_HLE_RING_CAP,
+                                               sizeof(PsxHleCallEntry));
+    } else if (s_ring_on < 0) {
+        s_ring_on = 0;
+    }
+    return s_ring_on > 0 && s_ring != NULL;
+}
+int psx_hle_ring_is_armed(void) { return s_ring != NULL; }
+static int hle_ring_on(void)
+{
+    if (s_ring_on < 0) {
+        const char *a = getenv("PSX_HLE_RING");
+        const char *b = getenv("PSX_DEBUG_HEAVY");
+        s_ring_on = ((a && *a && *a != '0') || (b && *b && *b != '0')) ? 1 : 0;
+        if (s_ring_on && !s_ring)
+            (void)psx_hle_ring_arm(1);
+    }
+    return s_ring != NULL;
+}
 
 static void hle_record(uint32_t vector, uint32_t fn, const CPUState* cpu,
                        uint32_t v0, uint8_t route)
 {
+    if (!hle_ring_on()) return;   /* diag2: ring armed on demand */
     /* Thread attribution: current TCB via the kernel's process block chain
      * (0x108 -> PCB, PCB[0] -> running TCB; SCPH1001 layout, stable across
      * kernel versions). Distinguishes which guest thread issued each call —
@@ -149,6 +177,7 @@ uint64_t psx_hle_ring_seq(void) { return s_ring_seq; }
 
 const PsxHleCallEntry* psx_hle_ring_entry(uint64_t seq_index)
 {
+    if (!s_ring) return NULL;
     if (seq_index >= s_ring_seq) return NULL;
     if (s_ring_seq - seq_index > PSX_HLE_RING_CAP) return NULL; /* evicted */
     return &s_ring[seq_index & (PSX_HLE_RING_CAP - 1)];

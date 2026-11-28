@@ -18,9 +18,18 @@ static uint32_t parity_rw_cb(void* ctx, uint32_t addr) {
 uint32_t parity_host_frame(void) { extern uint64_t s_frame_count; return (uint32_t)s_frame_count; }
 uint64_t parity_host_cycle(void) { extern uint64_t psx_get_cycle_count(void); return psx_get_cycle_count(); }
 
-/* Explicit .bss: without this, MinGW+LTO can emit ~144MiB of zeros into .rdata. */
-PSX_BSS FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
-uint64_t             g_fntrace_seq = 0;
+/* diag2: explicit lazy heap ring (was `PSX_BSS FntraceEntry g_fntrace_ring[...]`,
+ * 144 MiB committed at launch even though it is only written after
+ * fntrace_arm()). Allocated by fntrace_ring_ensure() on the first armed record. */
+FntraceEntry *g_fntrace_ring = NULL;
+uint64_t      g_fntrace_seq = 0;
+
+FntraceEntry *fntrace_ring_ensure(void) {
+    if (!g_fntrace_ring)
+        g_fntrace_ring = (FntraceEntry *)calloc(FNTRACE_RING_CAP,
+                                                sizeof(FntraceEntry));
+    return g_fntrace_ring;
+}
 
 /* Frame counter shared with debug_server.c / dirty_ram_interp.c. */
 extern uint64_t s_frame_count;
@@ -235,6 +244,7 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
     if ((target & 0x1FFFFFFFu) < 0x40u) g_insn_log_frozen = 1;
     if (!armed_match(target)) return;
     if (was_frozen) return;
+    if (!fntrace_ring_ensure()) return;          /* diag2: lazy 144 MiB ring */
     uint64_t idx = g_fntrace_seq++ & (FNTRACE_RING_CAP - 1);
     FntraceEntry* e = &g_fntrace_ring[idx];
     e->frame  = (uint32_t)s_frame_count;

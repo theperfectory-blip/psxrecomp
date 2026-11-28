@@ -136,9 +136,31 @@ extern uint64_t s_frame_count;
  * a few hundred audible-voice events per chime second; recomp at <1k total
  * per chime. 1M gives ~minutes of headroom for game-scene capture too. */
 #define SPU_EVENT_CAP (1u << 20)
-static SpuEvent  s_events[SPU_EVENT_CAP];
+/* diag2: 16 MiB ring, armed on demand (PSX_SPU_EVENTS=1 / PSX_DEBUG_HEAVY=1 /
+ * `spu_events`); counters are unaffected because the ring holds history only. */
+static SpuEvent *s_events = NULL;
 static uint32_t  s_event_idx = 0;
 static uint64_t  s_event_seq = 0;
+
+int spu_event_arm(int on) {
+    static int armed = -1;
+    if (on) armed = 1;
+    else if (armed < 0) armed = 0;
+    if (armed && !s_events)
+        s_events = (SpuEvent *)calloc(SPU_EVENT_CAP, sizeof(SpuEvent));
+    return armed && s_events != NULL;
+}
+static int spu_events_armed(void) {
+    static int init = 0;
+    if (!init) {
+        init = 1;
+        const char *a = getenv("PSX_SPU_EVENTS");
+        const char *b = getenv("PSX_DEBUG_HEAVY");
+        if ((a && *a && *a != '0') || (b && *b && *b != '0'))
+            (void)spu_event_arm(1);
+    }
+    return s_events != NULL;
+}
 
 /* CD input FIFO, fed by the CD-ROM XA decoder at 44.1 kHz stereo. */
 #define SPU_CD_RING_FRAMES (44100u * 8u)
@@ -194,6 +216,7 @@ int spu_bind_next_voice_bank(unsigned voice,uint32_t bank) {
 }
 
 static void spu_event_record(uint8_t kind, int voice, uint32_t addr) {
+    if (!spu_events_armed()) return;   /* diag2: lazy ring */
     SpuEvent *e = &s_events[s_event_idx & (SPU_EVENT_CAP - 1u)];
     e->seq      = s_event_seq++;
     e->frame    = (uint32_t)s_frame_count;
@@ -1083,7 +1106,8 @@ void spu_init(void) {
     memset(voices, 0, sizeof(voices));
     memset(private_regs,0,sizeof private_regs);memset(private_modes,0,sizeof private_modes);
     private_enabled=0;
-    memset(s_events, 0, sizeof(s_events));
+    if (s_events)   /* diag2: anillo perezoso; sizeof(puntero) borraba 8 B en NULL (cierre al arrancar) */
+        memset(s_events, 0, (size_t)SPU_EVENT_CAP * sizeof(SpuEvent));
     transfer_addr = 0;
     key_on_count = 0;
     render_frames = 0;
@@ -1860,7 +1884,7 @@ void spu_get_global_state(SpuGlobalState* out) {
 uint64_t spu_event_total(void) { return s_event_seq; }
 
 uint32_t spu_event_get(SpuEvent* out, uint32_t max_count) {
-    if (!out || max_count == 0) return 0;
+    if (!out || max_count == 0 || !s_events) return 0;   /* diag2: lazy ring */
     uint64_t avail = s_event_seq < (uint64_t)SPU_EVENT_CAP
                      ? s_event_seq : (uint64_t)SPU_EVENT_CAP;
     if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
@@ -1875,7 +1899,8 @@ uint32_t spu_event_get(SpuEvent* out, uint32_t max_count) {
 void spu_event_reset(void) {
     s_event_idx = 0;
     s_event_seq = 0;
-    memset(s_events, 0, sizeof(s_events));
+    if (s_events)   /* diag2: lazy ring */
+        memset(s_events, 0, (size_t)SPU_EVENT_CAP * sizeof(SpuEvent));
 }
 
 /* ---- boot snapshot: complete SPU register + voice state (LE field wire) ---- */
