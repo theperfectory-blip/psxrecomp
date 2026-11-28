@@ -123,6 +123,27 @@ void debug_server_shutdown(void);
 /* Check if a TCP client is connected. */
 int debug_server_is_connected(void);
 
+/* ---- Heavy-diagnostic master switches (diag1, 2026-11-27) ---------------
+ * The forensic rings below (per-store write trace, per-block observers,
+ * per-call rings, GP0 stream, per-frame display/VRAM capture, GTE projection
+ * ring, dirty-RAM block log) used to run unconditionally in every
+ * PSX_DEBUG_TOOLS build, which cost ~half the frame rate even with no client
+ * attached. They now ship DISARMED; arm them with `{"cmd":"diag_heavy",
+ * "on":1}` (or PSX_DEBUG_HEAVY=1 at launch, or the per-feature env var named
+ * in debug_server.c) only while a probe actually needs that history. The
+ * coordinator's live commands (read_ram, frame, press, screenshot, savestate,
+ * dirty_ram_stats, overlay_loader_status, turbo) never need them. */
+extern volatile int g_psx_diag_store;    /* RAM/MMIO write + read rings     */
+extern volatile int g_psx_diag_block;    /* per-block observers (cyc/probes)*/
+extern volatile int g_psx_diag_call;     /* per-dispatch / per-call rings   */
+extern volatile int g_psx_diag_gp0;      /* GP0 command stream ring         */
+extern volatile int g_psx_diag_disp;     /* per-frame display + VRAM ring   */
+extern volatile int g_psx_diag_present;  /* presented-image thumbnail ring  */
+extern volatile int g_psx_diag_gte;      /* GTE RTP/INTPL projection rings  */
+extern volatile int g_psx_diag_interp;   /* dirty-RAM block-entry log ring  */
+void debug_server_diag_heavy_set(int on);   /* 1 = all rings on, 0 = off */
+int  debug_server_diag_heavy_get(void);     /* 1 when every ring is armed */
+
 /* ---- Tier 1 reverse debugger: write trace ---- */
 
 /* Current dispatch target — set by psx_dispatch() before each call.

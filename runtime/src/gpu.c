@@ -6856,6 +6856,11 @@ static int gp0_ring_frozen = 0;
 void gpu_gp0_ring_set_frozen(int frozen) { gp0_ring_frozen = frozen ? 1 : 0; }
 
 static void gp0_ring_record(const uint32_t *words, int n) {
+    /* diag1: one command per primitive is the hottest thing in this file;
+     * ship disarmed, arm with `diag_heavy on` / PSX_GP0_RING=1 / any gp0_*
+     * command (capture_mark also arms it). */
+    extern volatile int g_psx_diag_gp0;
+    if (!g_psx_diag_gp0) return;
     if (gp0_ring_frozen) return;
     if (!gp0_ring) {
         gp0_ring = (GpuGp0RingEntry *)calloc(GP0_RING_CAP, sizeof(*gp0_ring));

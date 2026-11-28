@@ -702,6 +702,8 @@ static int ws_backdrop_site_kind(uint32_t pc, int *out_cols) {
 static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
                                       uint32_t before_s0, uint32_t next_pc,
                                       uint32_t target, int transferred) {
+    extern volatile int g_psx_diag_interp;   /* diag1: ring ships disarmed */
+    if (!g_psx_diag_interp) return;
     if (g_insn_log_frozen) return;
     /* Freeze-on-target (Confirm-(b)): checked BEFORE the gate filter so it fires
      * for ANY interpreted instruction transferring to the watched wild PC, even
@@ -770,6 +772,8 @@ static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
  * code emits no per-insn entries; markers keep the two runs' timelines
  * alignable). transferred: 200 = native entry, 201 = native exit. */
 void dirty_ram_log_marker(uint32_t addr, uint32_t tag, int kind) {
+    extern volatile int g_psx_diag_interp;   /* diag1: ring ships disarmed */
+    if (!g_psx_diag_interp) return;
     if (g_insn_log_frozen) return;
     uint64_t s = g_dirty_ram_insn_log_seq++;
     DirtyRamInsnLogEntry *e =
@@ -3194,7 +3198,11 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * stub" by capturing cpu->gpr[31] (the caller's RA) at dispatch time.
      * Always-on; eviction keeps memory bounded. Honors the capture freeze. */
 #ifndef PSX_NO_DEBUG_TOOLS
-    if (!g_insn_log_frozen) {
+    /* diag1: the block-entry log is a 4M-entry (224 MB) ring written on every
+     * interpreted block. Ship disarmed; arm with `diag_heavy on`,
+     * PSX_DIRTY_BLOCK_LOG=1 or any dirty_block/flow/insn command. */
+    { extern volatile int g_psx_diag_interp;
+      if (g_psx_diag_interp && !g_insn_log_frozen) {
         uint64_t s = g_dirty_ram_block_log_seq++;
         DirtyRamBlockLogEntry *e =
             &g_dirty_ram_block_log[s & (DIRTY_RAM_BLOCK_LOG_CAP - 1u)];
@@ -3210,7 +3218,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         e->t2     = cpu->gpr[10];
         e->sp     = cpu->gpr[29];
         e->frame  = (uint32_t)s_frame_count;
-    }
+      } }
 #endif
 
 #ifndef PSX_NO_DEBUG_TOOLS

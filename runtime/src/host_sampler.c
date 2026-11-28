@@ -20,6 +20,7 @@
 #include "host_sampler.h"
 
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 extern int g_psx_render_pass_active;
@@ -159,6 +160,22 @@ void host_sampler_start(void) {}
 #endif
 
 int host_sampler_supported(void) { return s_supported; }
+
+/* diag1: the boot-time default is OFF. PSX_HOST_SAMPLER=1 (or the
+ * all-rings switch PSX_DEBUG_HEAVY=1) restores sampling from launch. */
+int host_sampler_autostart(void) {
+#ifndef PSX_NO_DEBUG_TOOLS
+    static int on = -1;
+    if (on < 0) {
+        const char *a = getenv("PSX_HOST_SAMPLER");
+        const char *b = getenv("PSX_DEBUG_HEAVY");
+        on = ((a && a[0] && a[0] != '0') || (b && b[0] && b[0] != '0')) ? 1 : 0;
+    }
+    return on;
+#else
+    return 0;
+#endif
+}
 
 uint64_t host_sampler_seq(void) { return s_seq; }
 

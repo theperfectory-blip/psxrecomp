@@ -147,6 +147,7 @@ static SDL_mutex  *s_io_mutex    = NULL;
 static SDL_cond   *s_io_req_cv   = NULL;   /* emu waits on this for a request   */
 static SDL_cond   *s_io_resp_cv  = NULL;   /* I/O waits on this for a response  */
 static volatile int s_io_state   = IO_IDLE;
+static volatile int s_io_pending = 0;      /* diag1: lock-free "request queued" */
 static volatile int s_io_running  = 0;
 static char  s_io_req[RECV_BUF_SIZE];      /* request line (I/O -> emu)         */
 static char *s_resp_buf = NULL;            /* response bytes (emu -> I/O)       */
@@ -155,6 +156,51 @@ static int    s_resp_overflow = 0;
 static int    s_in_command = 0;            /* 1 while emu runs process_command  */
 static int    io_thread_main(void *arg);   /* defined near debug_server_poll    */
 static volatile int s_fmv_quiet = 0;
+
+/* ---- diag1 heavy-diagnostic gates (see debug_server.h) -------------------
+ * All default 0: every forensic ring is disarmed until a probe arms it, so a
+ * PSX_DEBUG_TOOLS build costs (almost) nothing while the coordinator only
+ * reads RAM / presses buttons / takes screenshots. */
+volatile int g_psx_diag_store   = 0;
+volatile int g_psx_diag_block   = 0;
+volatile int g_psx_diag_call    = 0;
+volatile int g_psx_diag_gp0     = 0;
+volatile int g_psx_diag_disp    = 0;
+volatile int g_psx_diag_present = 0;
+volatile int g_psx_diag_gte     = 0;
+volatile int g_psx_diag_interp  = 0;
+
+static int env_flag(const char *name) {
+    const char *e = getenv(name);
+    return (e && e[0] && e[0] != '0') ? 1 : 0;
+}
+
+void debug_server_diag_heavy_set(int on) {
+    g_psx_diag_store   = on ? 1 : 0;
+    g_psx_diag_block   = on ? 1 : 0;
+    g_psx_diag_call    = on ? 1 : 0;
+    g_psx_diag_gp0     = on ? 1 : 0;
+    g_psx_diag_disp    = on ? 1 : 0;
+    g_psx_diag_present = on ? 1 : 0;
+    g_psx_diag_gte     = on ? 1 : 0;
+    g_psx_diag_interp  = on ? 1 : 0;
+}
+
+int debug_server_diag_heavy_get(void) {
+    return (g_psx_diag_store && g_psx_diag_block && g_psx_diag_call &&
+            g_psx_diag_gp0 && g_psx_diag_disp && g_psx_diag_present &&
+            g_psx_diag_gte && g_psx_diag_interp) ? 1 : 0;
+}
+
+/* diag1: ring allocators (defined next to debug_server_init). */
+static int ensure_wtrace(void);
+static int ensure_wtrace_boot(void);
+static int ensure_wtrace_all(void);
+static int ensure_wtrace_trans(void);
+static int ensure_fn_rings(void);
+static int ensure_mmio_rings(void);
+static int ensure_mmio_rtrace(void);
+
 
 void debug_server_set_fmv_quiet(int quiet)
 {
@@ -2095,15 +2141,16 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
 #endif
+    /* diag1: cyc_watch anchors need this entry hook even when the call rings
+     * are disarmed; it self-gates on its own arm flag. */
+    if (g_psx_diag_block) cyc_watch_observe(func_addr & 0x1FFFFFFFu);
+    /* diag1: the per-call rings (card_mgr, sreg, call_focus, fn_entry) are
+     * forensics; with them disarmed this is one flag check per function entry
+     * instead of three ring probes + a TCB memory read. */
+    if (!g_psx_diag_call) return;
     if (s_fmv_quiet) return;
     ls_suppress_begin();
     if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
-    /* cyc_watch: universal compiled-function-entry hook (game AND BIOS, incl.
-     * relocated BIOS-shell funcs which dispatch oddly but still log their entry
-     * here). Sampled at function entry, before the body runs — matches the
-     * Beetle side (PC==anchor, before execute). Covers the game-dispatch path
-     * that debug_server_trace_dispatch misses. */
-    cyc_watch_observe(func_addr & 0x1FFFFFFFu);
     s_fn_direct_seen++;
     if (!debug_cpu_ptr) {
         s_fn_direct_no_cpu++;
@@ -2113,7 +2160,7 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     card_mgr_trace_record(func_addr, 0);
     sreg_trace_record(func_addr);
     call_focus_record(func_addr);
-    if (!s_fn_entry) { ls_suppress_end(); return; }
+    if (!ensure_fn_rings()) { ls_suppress_end(); return; }
     if (!fn_trace_in_filter(func_addr)) { ls_suppress_end(); return; }
     s_fn_direct_filtered++;
     FnEntryEntry *e = &s_fn_entry[s_fn_entry_seq % FN_TRACE_CAP];
@@ -2983,6 +3030,11 @@ void debug_server_cyc_observe(uint32_t block_leader_phys) {
 #else
     uint32_t phys = block_leader_phys & 0x1FFFFFFFu;
     g_psx_last_block = phys;
+    /* diag1: every compiled block leader calls this. The five per-block
+     * observers (cyc_watch, pc_probe, retprobe, fnprobe, lockstep) plus this
+     * ND-debug block only run when armed; otherwise one flag check. The
+     * guest-cycle profile (gcp_ring) keeps g_psx_last_block above. */
+    if (!g_psx_diag_block) return;
     if (s_fmv_quiet) return;
     /* ND debug: PSX_ND_WOOD_CLEAR80=1 clears model+184 bit0x80 at the flag-load
      * leader so 0x5CF/'cras' models enter NdIntroWoodBatchSetup's textured path.
@@ -3068,6 +3120,10 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
     (void)func_addr;
     return;
 #endif
+    /* diag1: this runs on EVERY guest dispatch. Until a probe arms the call
+     * rings (diag_heavy on, PSX_DEBUG_HEAVY=1, or any fn_/dispatch/card_mgr
+     * command) it must cost one branch, not a register dump per dispatch. */
+    if (!g_psx_diag_call) return;
     if (s_fmv_quiet) return;
     ls_suppress_begin();
     /* cyc_watch: compiled-dispatch path. func_addr is already the physical
@@ -5734,6 +5790,7 @@ static void handle_geom_correction(int id, const char *json)
  * "seq" from one reply as "since" of the next to profile what ran between. */
 static void handle_host_profile(int id, const char *json)
 {
+    host_sampler_start();   /* diag1: first request arms the 1 kHz sampler */
     enum { MAXB = 4096 };
     static uint64_t rvas[MAXB];
     static uint32_t counts[MAXB];
@@ -8451,6 +8508,10 @@ static void handle_press(int id, const char *json)
     if (pad_type < -1 || pad_type > 2) {
         send_err(id, "pad_type must be -1 (automatic), 0, 1, or 2"); return;
     }
+    /* diag1: frames=0 used to leave the override armed forever (the decrement
+     * only runs while frames>0), i.e. the port kept overriding the real pad
+     * after the "press" was over. A press always lasts at least one frame. */
+    if (frames < 1) frames = 1;
     if (json_get_int(json, "port", 1) == 2) {
         s_input_override_p2 = buttons & 0xFFFF;
         s_input_frames_p2   = frames;
@@ -10971,6 +11032,12 @@ static void handle_wide_shot(int id, const char *json)
 void debug_server_capture_mark(void)
 {
     if (s_capture_frozen) return;
+    /* diag1: a mark is only useful if the rings it freezes were recording.
+     * Arm them now so the frames AFTER the mark are captured (they ship
+     * disarmed for speed). */
+    g_psx_diag_disp = 1;
+    g_psx_diag_gp0 = 1;
+    g_psx_diag_present = 1;
     s_capture_mark_frame = s_frame_count;
     s_capture_mark_count++;
     snprintf(s_capture_wide_path, sizeof s_capture_wide_path,
@@ -11507,8 +11574,8 @@ static inline int capture_frozen(void) {
 
 static void wtrace_record(uint32_t phys, uint32_t old_val, uint32_t new_val, uint8_t width)
 {
-    if (!s_wtrace) return;
     if (capture_frozen()) return;
+    if (!ensure_wtrace()) return;
     WriteTraceEntry *e = &s_wtrace[s_wtrace_head];
     wtrace_fill_entry(e, s_wtrace_seq++, phys, old_val, new_val, width);
     s_wtrace_head = (s_wtrace_head + 1) % WRITE_TRACE_CAP;
@@ -11517,7 +11584,7 @@ static void wtrace_record(uint32_t phys, uint32_t old_val, uint32_t new_val, uin
 static void wtrace_boot_record(uint32_t phys, uint32_t old_val,
                                uint32_t new_val, uint8_t width)
 {
-    if (!s_wtrace_boot || s_wtrace_boot_range_count == 0) return;
+    if (s_wtrace_boot_range_count == 0) return;
     int match = 0;
     for (int i = 0; i < s_wtrace_boot_range_count; i++) {
         if (phys >= s_wtrace_boot_ranges[i].lo &&
@@ -11527,6 +11594,7 @@ static void wtrace_boot_record(uint32_t phys, uint32_t old_val,
         }
     }
     if (!match) return;
+    if (!ensure_wtrace_boot()) return;
 
     uint64_t seq = s_wtrace_boot_total++;
     if (s_wtrace_boot_count >= WRITE_TRACE_BOOT_CAP) return;
@@ -11537,7 +11605,7 @@ static void wtrace_boot_record(uint32_t phys, uint32_t old_val,
 /* Always-on catch-all recorder.  Lean record (no register window). */
 static void wtrace_all_record(uint32_t phys, uint32_t new_val, uint8_t width)
 {
-    if (!s_wtrace_all) return;
+    if (!ensure_wtrace_all()) return;
     WriteTraceAllEntry *e = &s_wtrace_all[s_wtrace_all_head];
     e->seq     = s_wtrace_all_seq++;
     e->addr    = phys;
@@ -11552,7 +11620,7 @@ static void wtrace_all_record(uint32_t phys, uint32_t new_val, uint8_t width)
 static void wtrace_transition_record(uint32_t phys, uint32_t old_val,
                                      uint32_t new_val, uint8_t width)
 {
-    if (!s_wtrace_trans || s_wtrace_trans_range_count == 0) return;
+    if (s_wtrace_trans_range_count == 0) return;
     if (old_val == new_val) return;
 
     int match = 0;
@@ -11564,6 +11632,7 @@ static void wtrace_transition_record(uint32_t phys, uint32_t old_val,
         }
     }
     if (!match) return;
+    if (!ensure_wtrace_trans()) return;
 
     WriteTraceTransEntry *e = &s_wtrace_trans[s_wtrace_trans_head];
     e->seq       = s_wtrace_trans_seq++;
@@ -11676,6 +11745,11 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     (void)phys; (void)old_val; (void)new_val; (void)width;
     return;
 #endif
+    /* diag1: every guest store lands here. With the rings disarmed this is one
+     * volatile load, instead of ~5 ring writes (incl. the 128 MB catch-all)
+     * per store. Arm with `diag_heavy on`, PSX_WTRACE=1 or any wtrace/record
+     * command. */
+    if (!g_psx_diag_store) return;
     /* Render passes are rolled back; keep them out of the live timeline's
      * fingerprints and write traces (docs/RENDER_PASSES.md). */
     if (g_psx_render_pass_active) return;
@@ -11712,12 +11786,15 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
     (void)addr; (void)val; (void)width;
     return;
 #endif
+    /* diag1: device writes are far less frequent than RAM stores, but still
+     * per-GP0-command; one flag check keeps them free until armed. */
+    if (!g_psx_diag_store) return;
     if (s_fmv_quiet) { psx_fp_note_quiet(&s_fp); return; }
     /* First-divergence fingerprint + frame recorder also see device writes. */
     fp_record_mmio(addr, val, g_debug_last_store_pc);
     rec_event(REC_KIND_MMIO_W, addr, val, g_debug_last_store_pc,
               debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0);
-    if (!s_mmio_trace) return;
+    if (!s_mmio_trace && !ensure_mmio_rings()) return;
     if (capture_frozen()) return;
     MmioTraceEntry *e = &s_mmio_trace[s_mmio_trace_head];
     e->seq       = s_mmio_trace_seq++;
@@ -11760,10 +11837,13 @@ void debug_server_trace_mmio_read(uint32_t addr, uint32_t val, uint8_t width)
     (void)addr; (void)val; (void)width;
     return;
 #endif
+    /* diag1: MMIO reads (timer/GPU/SIO polls) are hot on some frames. */
+    if (!g_psx_diag_store) return;
     if (s_fmv_quiet) return;
     rec_event(REC_KIND_MMIO_R, addr, val, g_debug_last_store_pc,
               debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0);
-    if (!s_mmio_rtrace || s_mmio_rtrace_range_count == 0) return;
+    if (!s_mmio_rtrace && !ensure_mmio_rtrace()) return;
+    if (s_mmio_rtrace_range_count == 0) return;
     if (capture_frozen()) return;
     uint32_t phys = addr & 0x1FFFFFFFu;
     int hit = 0;
@@ -11888,6 +11968,7 @@ static void cyc_watch_arm(uint32_t raw, uint32_t end_raw, int n)
     s_cyc_watch_last_phys   = 0xFFFFFFFFu;   /* reset dedupe state per arm */
     s_cyc_watch_last_cycle  = 0xFFFFFFFFFFFFFFFFull;
     memset(s_cyc_watch_ring, 0, sizeof(s_cyc_watch_ring));
+    g_psx_diag_block = 1;   /* diag1: enable the per-block observers on demand */
     s_cyc_watch_armed = 1;
 }
 
@@ -11982,6 +12063,7 @@ static void handle_pc_probe_arm(int id, const char *json)
         return;
     }
     s_pc_probe_armed = 1;
+    g_psx_diag_block = 1;   /* diag1: arm the per-block observers */
     send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"n_pcs\":%d,\"sample_max\":%u,\"nd_intro\":%d}",
              id, s_pc_probe_n, s_pc_probe_sample_max, nd);
 }
@@ -12071,6 +12153,7 @@ static void handle_retprobe_arm(int id, const char *json)
     if (n < 1) n = 1;
     if (n > RETPROBE_CAP) n = RETPROBE_CAP;
     s_retprobe_max = (uint64_t)n;
+    g_psx_diag_block = 1;   /* diag1: arm the per-block observers */
     s_retprobe_armed = 1;
     send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"npcs\":%d,\"nram\":%d,\"max\":%d}",
              id, s_retprobe_npcs, s_retprobe_nram, n);
@@ -12105,6 +12188,7 @@ static void handle_fnprobe_arm(int id, const char *json)
         send_err(id, "fnprobe_arm needs fns=0xA,0xB,...");
         return;
     }
+    g_psx_diag_block = 1;   /* diag1: fnprobe rides the per-block observer */
     send_fmt("{\"id\":%d,\"ok\":true,\"armed\":1,\"nfns\":%d,\"nram\":%d,\"nramrel\":%d,\"snap\":%d,\"max\":%d}",
              id, s_fnp_nfns, s_fnp_nram, s_fnp_nramrel, s_fnp_snap, n);
 }
@@ -15989,6 +16073,13 @@ static void *phase_sampler_main(void *arg)
 
 static void phase_sampler_start(void)
 {
+    static int started = 0;
+    if (started) return;
+    /* diag1: this thread wakes every 1 ms forever; start it only when a
+     * phase profile is actually wanted (PSX_PHASE_SAMPLER=1 or PSX_DEBUG_HEAVY=1,
+     * or lazily from the `phase_profile` command). */
+    if (!env_flag("PSX_PHASE_SAMPLER") && !env_flag("PSX_DEBUG_HEAVY")) return;
+    started = 1;
 #ifdef _WIN32
     HANDLE h = CreateThread(NULL, 0, phase_sampler_main, NULL, 0, NULL);
     if (h) CloseHandle(h);
@@ -16001,6 +16092,7 @@ static void phase_sampler_start(void)
 
 static void handle_phase_profile(int id, const char *json)
 {
+    phase_sampler_start();   /* diag1: first request arms the sampler */
     int window = json_get_int(json, "window", 10);
     if (window < 1) window = 1;
     if (window > PHASE_RING_SECS - 2) window = PHASE_RING_SECS - 2;
@@ -16300,7 +16392,26 @@ static void handle_warm_cd_route(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,%s}\n", id, body);
 }
 
+static void handle_diag_heavy(int id, const char *json)
+{
+    int on = json_get_int(json, "on", -1);
+    if (on < 0) {
+        const char *act = NULL;
+        char actbuf[16];
+        if (json_get_str(json, "op", actbuf, sizeof(actbuf))) act = actbuf;
+        if (act && !strcmp(act, "on")) on = 1;
+        else if (act && !strcmp(act, "off")) on = 0;
+    }
+    if (on >= 0) debug_server_diag_heavy_set(on);
+    send_fmt("{\"id\":%d,\"ok\":true,\"store\":%d,\"block\":%d,\"call\":%d,"
+             "\"gp0\":%d,\"disp\":%d,\"present\":%d,\"gte\":%d,\"interp\":%d}",
+             id, g_psx_diag_store, g_psx_diag_block, g_psx_diag_call,
+             g_psx_diag_gp0, g_psx_diag_disp, g_psx_diag_present,
+             g_psx_diag_gte, g_psx_diag_interp);
+}
+
 static const CmdEntry s_commands[] = {
+    { "diag_heavy",        handle_diag_heavy },
     { "phase_profile",     handle_phase_profile },
     { "starv_ring",        handle_starv_ring },
     { "data_shards",       handle_data_shards },
@@ -16682,6 +16793,62 @@ static const CmdEntry s_commands[] = {
     { NULL, NULL }
 };
 
+/* diag1: arm the forensic ring a command is about to read, so the existing
+ * probes keep working while the rings ship disarmed. Prefix based: any
+ * member of a family arms its family. `diag_heavy` covers everything. */
+static void diag_arm_for_command(const char *cmd)
+{
+    static const struct { const char *prefix; int bit; } tab[] = {
+        /* per-store / per-MMIO rings */
+        { "wtrace",        1 }, { "rtrace",        1 },
+        { "record_frame",  1 }, { "frame_fingerprint", 1 },
+        { "capture_freeze",1 }, { "mmio",          1 },
+        { "card_",         1 }, { "d44_ring",      1 },
+        { "sp_ring",       1 }, { "irqctx_ring",   1 },
+        { "bioscall",      1 },
+        /* per-block observers */
+        { "cyc_watch",     2 }, { "pc_probe",      2 },
+        { "retprobe",      2 }, { "fnprobe",       2 },
+        { "lockstep",      2 },
+        /* per-dispatch / per-call rings */
+        { "fn_",           4 }, { "fntrace",       4 },
+        { "call_focus",    4 }, { "card_mgr",      4 },
+        { "sreg_trace",    4 }, { "thread_trace",  4 },
+        { "thread_ctx_ring", 4 }, { "restore_trace", 4 },
+        { "probe_trace",   4 }, { "probe_clear",   4 },
+        { "dispatch_",     4 }, { "segment_misses",4 },
+        { "unknown_dispatch_log", 4 }, { "event_ring", 4 },
+        { "evcb_",         4 },
+        /* GPU command stream */
+        { "gpu_frame_dump", 8 }, { "gpu_ring_stats", 8 },
+        { "gpu_opcodes",   8 }, { "gp0",           8 },
+        { "capture_mark",  8 | 16 | 32 },
+        /* per-frame display / VRAM capture */
+        { "disp_ring",     16 }, { "display_ring", 16 },
+        /* presented-image thumbnails */
+        { "present_image_ring", 32 }, { "present_shot", 32 },
+        { "present_ring",  32 }, { "wide_shot",    32 },
+        { "host_osd_shot", 32 },
+        /* GTE projection rings, dirty-RAM block log */
+        { "gte_",          64 },
+        { "dirty_block",   128 }, { "dirty_flow",  128 },
+        { "dirty_insn",    128 }, { "insn_",       128 },
+        { "xprobe",        128 },
+    };
+    for (size_t i = 0; i < sizeof(tab) / sizeof(tab[0]); i++) {
+        const size_t n = strlen(tab[i].prefix);
+        if (strncmp(cmd, tab[i].prefix, n) != 0) continue;
+        if (tab[i].bit & 1)   g_psx_diag_store   = 1;
+        if (tab[i].bit & 2)   g_psx_diag_block   = 1;
+        if (tab[i].bit & 4)   g_psx_diag_call    = 1;
+        if (tab[i].bit & 8)   g_psx_diag_gp0     = 1;
+        if (tab[i].bit & 16)  g_psx_diag_disp    = 1;
+        if (tab[i].bit & 32)  g_psx_diag_present = 1;
+        if (tab[i].bit & 64)  g_psx_diag_gte     = 1;
+        if (tab[i].bit & 128) g_psx_diag_interp  = 1;
+    }
+}
+
 static void process_command(const char *line)
 {
     char cmd[64];
@@ -16694,6 +16861,9 @@ static void process_command(const char *line)
     }
 
     int id = json_get_int(line, "id", 0);
+
+    /* diag1: arm the ring family this command reads (cheap prefix scan). */
+    diag_arm_for_command(cmd);
 
     for (const CmdEntry *e = s_commands; e->name; e++) {
         if (strcmp(cmd, e->name) == 0) {
@@ -16801,9 +16971,77 @@ malformed:
     return n;
 }
 
+/* ---- diag1: lazy ring allocation ---------------------------------------
+ * These forensic rings total ~300 MB when all are resident. Allocating them
+ * at boot was pure overhead for a play session that only polls RAM. Each
+ * ensure_*() is called from the (already gated) record path, so a ring is
+ * allocated on the first write after it is armed. */
+static int ensure_wtrace(void) {
+    if (!s_wtrace)
+        s_wtrace = (WriteTraceEntry *)calloc(WRITE_TRACE_CAP, sizeof(WriteTraceEntry));
+    return s_wtrace != NULL;
+}
+static int ensure_wtrace_boot(void) {
+    if (!s_wtrace_boot)
+        s_wtrace_boot = (WriteTraceEntry *)calloc(WRITE_TRACE_BOOT_CAP, sizeof(WriteTraceEntry));
+    return s_wtrace_boot != NULL;
+}
+static int ensure_wtrace_all(void) {
+    if (!s_wtrace_all)
+        s_wtrace_all = (WriteTraceAllEntry *)calloc(WRITE_TRACE_ALL_CAP,
+                                                    sizeof(WriteTraceAllEntry));
+    return s_wtrace_all != NULL;
+}
+static int ensure_wtrace_trans(void) {
+    if (!s_wtrace_trans)
+        s_wtrace_trans = (WriteTraceTransEntry *)calloc(WRITE_TRACE_TRANS_CAP,
+                                                        sizeof(WriteTraceTransEntry));
+    return s_wtrace_trans != NULL;
+}
+static int ensure_fn_rings(void) {
+    if (!s_fn_entry)
+        s_fn_entry = (FnEntryEntry *)calloc(FN_TRACE_CAP, sizeof(FnEntryEntry));
+    if (!s_fn_exit)
+        s_fn_exit = (FnExitEntry *)calloc(FN_EXIT_TRACE_CAP, sizeof(FnExitEntry));
+    return s_fn_entry != NULL && s_fn_exit != NULL;
+}
+static int ensure_mmio_rings(void) {
+    if (!s_mmio_trace)
+        s_mmio_trace = (MmioTraceEntry *)calloc(MMIO_TRACE_CAP, sizeof(MmioTraceEntry));
+    if (!s_gp1_trace)
+        s_gp1_trace = (MmioTraceEntry *)calloc(GP1_TRACE_CAP, sizeof(MmioTraceEntry));
+    return s_mmio_trace != NULL && s_gp1_trace != NULL;
+}
+static int ensure_mmio_rtrace(void) {
+    if (!s_mmio_rtrace)
+        s_mmio_rtrace = (MmioTraceEntry *)calloc(MMIO_TRACE_CAP, sizeof(MmioTraceEntry));
+    return s_mmio_rtrace != NULL;
+}
+
 void debug_server_init(int port)
 {
     if (port > 0) s_port = port;
+
+    /* diag1: the heavy forensic rings are OPT-IN. PSX_DEBUG_HEAVY=1 restores
+     * the old always-on behaviour; the per-feature variables keep working for
+     * scripts that set them today. Everything stays armable over TCP with
+     * {"cmd":"diag_heavy","on":1} or by the first command that reads each
+     * ring (see diag_arm_for_command). */
+    if (env_flag("PSX_DEBUG_HEAVY")) debug_server_diag_heavy_set(1);
+    if (env_flag("PSX_WTRACE"))            g_psx_diag_store = 1;
+    if (env_flag("PSX_RECORD_FRAME"))      g_psx_diag_store = 1;
+    if (env_flag("PSX_READ_WATCH"))        g_psx_diag_store = 1;
+    if (env_flag("PSX_GP0_RING"))          g_psx_diag_gp0 = 1;
+    if (env_flag("PSX_DISPLAY_RING"))      g_psx_diag_disp = 1;
+    if (env_flag("PSX_PRESENT_IMAGE_RING")) g_psx_diag_present = 1;
+    if (env_flag("PSX_GTE_RING"))          g_psx_diag_gte = 1;
+    if (env_flag("PSX_DIRTY_BLOCK_LOG"))   g_psx_diag_interp = 1;
+    if (env_flag("PSX_CYC_WATCH") || env_flag("PSX_PC_PROBE") ||
+        env_flag("PSX_ND_INTRO_PROBE") || env_flag("PSX_ND_WOOD_CLEAR80") ||
+        env_flag("PSX_ND_SIB_OT_LIFT"))
+        g_psx_diag_block = 1;
+    if (env_flag("PSX_FNTRACE_ARM") || env_flag("PSX_FN_FILTER"))
+        g_psx_diag_call = 1;
 
     /* Deterministic cold-boot controller probe. Unlike a TCP set_input command,
      * which can only arrive after the guest has already started polling, this
@@ -16964,44 +17202,26 @@ void debug_server_init(int port)
     }
     s_history_count = 0;
 
-    /* Tier 1: heap-allocate write trace ring buffer (32 MB). */
-    if (!s_wtrace) {
-        s_wtrace = (WriteTraceEntry *)calloc(WRITE_TRACE_CAP, sizeof(WriteTraceEntry));
-    }
+    /* Tier 1: write trace ring buffer. diag1: allocated on first armed write
+     * (ensure_wtrace), not at boot. */
     s_wtrace_seq = 0;
     s_wtrace_head = 0;
 
-    if (!s_wtrace_boot) {
-        s_wtrace_boot =
-            (WriteTraceEntry *)calloc(WRITE_TRACE_BOOT_CAP, sizeof(WriteTraceEntry));
-    }
     s_wtrace_boot_total = 0;
     s_wtrace_boot_count = 0;
     s_wtrace_boot_range_count = 0;
 
-    /* Always-on catch-all wtrace ring (8 MB). Records EVERY RAM write
-     * with lean fields (no register window). Sized for ~1 second of
-     * coverage at typical Tomba write rates. */
-    if (!s_wtrace_all) {
-        s_wtrace_all = (WriteTraceAllEntry *)calloc(WRITE_TRACE_ALL_CAP,
-                                                    sizeof(WriteTraceAllEntry));
-    }
+    /* Catch-all wtrace ring: also lazy (see ensure_wtrace_all). */
     s_wtrace_all_seq  = 0;
     s_wtrace_all_head = 0;
 
-    if (!s_wtrace_trans) {
-        s_wtrace_trans = (WriteTraceTransEntry *)calloc(WRITE_TRACE_TRANS_CAP,
-                                                        sizeof(WriteTraceTransEntry));
-    }
     s_wtrace_trans_seq = 0;
     s_wtrace_trans_head = 0;
     s_wtrace_trans_range_count = 0;
 
     fntrace_arm_from_env("PSX_FNTRACE_ARM");
 
-    /* Function entry/exit ring buffers (32 MB each, 64 MB total). */
-    if (!s_fn_entry) s_fn_entry = (FnEntryEntry *)calloc(FN_TRACE_CAP, sizeof(FnEntryEntry));
-    if (!s_fn_exit)  s_fn_exit  = (FnExitEntry *)calloc(FN_EXIT_TRACE_CAP, sizeof(FnExitEntry));
+    /* Function entry/exit rings: lazy (ensure_fn_rings). */
     s_fn_entry_seq = 0;
     s_fn_exit_seq  = 0;
     s_fn_stack_top = 0;
@@ -17260,27 +17480,18 @@ void debug_server_init(int port)
      * wtrace_boot_stats / wtrace_trans_stats report env_ranges and env_error. */
     wtrace_apply_env_ranges(getenv("PSX_WTRACE_BOOT_RANGES"));
 
-    /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
-    if (!s_mmio_trace) {
-        s_mmio_trace = (MmioTraceEntry *)calloc(MMIO_TRACE_CAP, sizeof(MmioTraceEntry));
-    }
+    /* Tier 1: MMIO trace rings. diag1: allocated lazily by ensure_mmio_rings. */
     s_mmio_trace_seq = 0;
     s_mmio_trace_head = 0;
 
     /* Dedicated GP1 display-control ring (long retention). */
-    if (!s_gp1_trace) {
-        s_gp1_trace = (MmioTraceEntry *)calloc(GP1_TRACE_CAP, sizeof(MmioTraceEntry));
-    }
     s_gp1_trace_seq = 0;
     s_gp1_trace_head = 0;
 
     /* MMIO-READ trace ring (range-filtered). Default-armed from init to the CD
      * regs + I_STAT/I_MASK so the IRQ handler's reads of the CD IRQ-flag and
      * interrupt status are captured continuously (Rule: always-on ring; probes
-     * query the window). Reuses MMIO_TRACE_CAP entries (~21 MB). */
-    if (!s_mmio_rtrace) {
-        s_mmio_rtrace = (MmioTraceEntry *)calloc(MMIO_TRACE_CAP, sizeof(MmioTraceEntry));
-    }
+     * query the window). diag1: only while the store rings are armed. */
     s_mmio_rtrace_seq = 0;
     s_mmio_rtrace_head = 0;
     s_mmio_rtrace_ranges[0].lo = 0x1F801800u; s_mmio_rtrace_ranges[0].hi = 0x1F801804u; /* CD regs (idx/IRQ-flag) */
@@ -17340,6 +17551,7 @@ static int io_thread_main(void *arg)
         strncpy(s_io_req, req, sizeof(s_io_req) - 1);
         s_io_req[sizeof(s_io_req) - 1] = '\0';
         s_io_state = IO_REQ;
+        s_io_pending = 1;          /* diag1: wake the per-frame poll cheaply */
         SDL_CondSignal(s_io_req_cv);
         int waited = 0;
         while (s_io_state != IO_RESP && s_io_running) {
@@ -17380,8 +17592,12 @@ void debug_server_poll(void)
 
     if (!s_io_mutex || s_in_command) return;   /* no server, or re-entrant */
 
+    /* diag1: no client traffic -> no lock, no work. This is the per-vblank
+     * path, so it must be one load when nobody is connected. */
+    if (!s_io_pending) return;
+
     SDL_LockMutex(s_io_mutex);
-    if (s_io_state != IO_REQ) { SDL_UnlockMutex(s_io_mutex); return; }
+    if (s_io_state != IO_REQ) { s_io_pending = 0; SDL_UnlockMutex(s_io_mutex); return; }
     char req[RECV_BUF_SIZE];
     strncpy(req, s_io_req, sizeof(req) - 1);
     req[sizeof(req) - 1] = '\0';
@@ -17393,6 +17609,7 @@ void debug_server_poll(void)
     s_in_command = 1;
     if (req[0]) process_command(req);
     s_in_command = 0;
+    s_io_pending = 0;
 
     SDL_LockMutex(s_io_mutex);
     /* Only deliver if the I/O thread is still waiting (it may have timed out and
@@ -17475,8 +17692,10 @@ void debug_server_record_frame(void)
     strcpy(r->last_func, "(no tracking)");
 
     /* Always-on display ring: raw display-area pixels for THIS frame number
-     * (pre-increment, matching what the `frame` command reports right now). */
-    disp_ring_capture();
+     * (pre-increment, matching what the `frame` command reports right now).
+     * diag1: only when armed — this is a full-VRAM GL readback (a hard
+     * GPU->CPU sync) plus a 1 MB copy every single frame. */
+    if (g_psx_diag_disp) disp_ring_capture();
 
     s_history_count = s_frame_count + 1;
     s_frame_count++;
@@ -17567,8 +17786,13 @@ int debug_server_get_input_override(void)
     }
     int current = s_input_override;
     if (s_input_override >= 0 && s_input_frames > 0) {
-        if (--s_input_frames == 0)
+        if (--s_input_frames == 0) {
             s_input_override = -1;
+            /* diag1: the press is over -> release everything it forced, so the
+             * real pad (type, sticks) is sampled again exactly as before. */
+            s_pad_type_override = -1;
+            s_axis_override = 0;
+        }
     }
     return current;
 }

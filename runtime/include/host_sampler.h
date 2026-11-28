@@ -18,6 +18,11 @@ typedef struct HostSample {
 
 /* Start sampling the calling thread (the emulation thread). Idempotent. */
 void host_sampler_start(void);
+/* diag1: 1 when the build should sample from boot (PSX_HOST_SAMPLER=1 or
+ * PSX_DEBUG_HEAVY=1). Default 0: the sampler suspends the emulation thread
+ * 1000x/s at time-critical priority, which alone costs frames and input
+ * latency. `host_profile` starts it on demand. */
+int  host_sampler_autostart(void);
 int host_sampler_supported(void);
 /* Total samples recorded; the ring holds the newest HOST_SAMPLER_CAP. */
 uint64_t host_sampler_seq(void);

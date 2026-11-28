@@ -18,11 +18,22 @@ static uint32_t s_sequence = 0;
 static int s_enabled = -1;
 static int s_frozen = 0;
 
+#if !defined(PSX_NO_DEBUG_TOOLS)
+extern volatile int g_psx_diag_present;   /* diag1 gate (debug_server.c) */
+#endif
+
 static int ring_ready(void) {
     if (s_enabled < 0) {
+        /* diag1: this was default-ON in every debug build and costs a
+         * box-downscale of the whole presented frame plus ~100 MB. Default
+         * OFF; PSX_PRESENT_IMAGE_RING=1, `diag_heavy on`, or any present_*
+         * command turns it on. */
         const char *e = getenv("PSX_PRESENT_IMAGE_RING");
-        s_enabled = (!e || !*e || *e != '0') ? 1 : 0;
+        s_enabled = (e && *e && *e != '0') ? 1 : 0;
     }
+#if !defined(PSX_NO_DEBUG_TOOLS)
+    if (g_psx_diag_present) return 1;
+#endif
     if (!s_enabled) return 0;
     if (!s_pixels) {
         const size_t per = (size_t)PRESENT_IMAGE_RING_MAX_W * PRESENT_IMAGE_RING_H;

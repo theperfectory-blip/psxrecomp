@@ -19088,7 +19088,10 @@ session_reboot:
         std::atexit(game_options_save_now);
 #ifndef PSX_NO_DEBUG_TOOLS
         debug_server_init(debug_port);
-        host_sampler_start();   /* this is the emulation thread */
+        /* diag1: the 1 kHz SuspendThread profiler is opt-in; `host_profile`
+         * (or PSX_HOST_SAMPLER=1) starts it on request. */
+        if (host_sampler_autostart())
+            host_sampler_start();   /* this is the emulation thread */
 #else
         (void)debug_port;
 #endif

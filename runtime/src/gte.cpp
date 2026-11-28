@@ -20,6 +20,10 @@ extern "C" int gpu_ws_precise_nclip_enabled(void);
 extern "C" int psx_overlay_shadow_diff_active(void);
 extern "C" uint64_t s_frame_count;            /* debug_server.c */
 extern "C" uint32_t g_debug_last_store_pc;     /* debug_server.c */
+/* diag1: heavy-diagnostic master switch (debug_server.c). Declared with C
+ * linkage here, at namespace scope, so every use inside PSXRecomp::GTE
+ * resolves to the C symbol (a block-scope extern would get C++ linkage). */
+extern "C" volatile int g_psx_diag_gte;
 extern "C" { int (*g_psx_projection_command)(CPUState*, uint32_t) = nullptr; }
 
 namespace PSXRecomp {
@@ -788,6 +792,9 @@ extern "C" void gte_render_view_set(const int32_t xyz[3]) {
 }
 
 static void gte_rtp_record(const GTEState* g, uint32_t cmd) {
+    /* diag1: one call per projective vertex; ship disarmed. Arm with
+     * `diag_heavy on`, PSX_GTE_RING=1 or any gte_* command. */
+    if (!g_psx_diag_gte) return;
     if (s_gte_replay_sandbox) return;
     if (!s_gte_rtp_ring) {
         s_gte_rtp_ring = (GteRtpRec*)calloc(GTE_RTP_RING_CAP, sizeof(GteRtpRec));
@@ -868,10 +875,10 @@ static uint64_t     s_gte_intpl_seq  = 0;
 
 static void gte_intpl_record(const GTEState* g,
                              const int16_t pre_ir[4], const int32_t pre_fc[3]) {
+    if (!g_psx_diag_gte) return;
     if (s_gte_replay_sandbox) return;
     if (!s_gte_intpl_ring) {
-        s_gte_intpl_ring = (GteIntplRec*)calloc(GTE_INTPL_RING_CAP, sizeof(GteIntplRec));
-        if (!s_gte_intpl_ring) return;
+        s_gte_intpl_ring = (GteIntplRec*)calloc(GTE_INTPL_RING_CAP, sizeof(GteIntplRec));        if (!s_gte_intpl_ring) return;
     }
     GteIntplRec* e = &s_gte_intpl_ring[s_gte_intpl_seq % GTE_INTPL_RING_CAP];
     e->seq = (uint32_t)s_gte_intpl_seq;
@@ -2344,8 +2351,12 @@ static void gte_execute_impl(CPUState* cpu, uint32_t cmd, bool charge_latency) {
     if (observe_projection) std::memcpy(original_transform, cpu->gte_ctrl, sizeof original_transform);
     const bool intermediate = observe_projection && g_psx_projection_command(cpu, cmd);
 #ifndef PSX_NO_DEBUG_TOOLS
-    if (!s_gte_replay_sandbox) s_gte_exec_count++;
-    s_gte_caller_ra = cpu->gpr[31];   /* dome-locate probe: game fn that issued this projection */
+    {
+        if (g_psx_diag_gte) {   /* diag1 master switch */
+            if (!s_gte_replay_sandbox) s_gte_exec_count++;
+            s_gte_caller_ra = cpu->gpr[31];   /* dome-locate probe: game fn that issued this projection */
+        }
+    }
 #endif
 
     GTEState gte;
@@ -2362,11 +2373,11 @@ static void gte_execute_impl(CPUState* cpu, uint32_t cmd, bool charge_latency) {
      * after the switch). Debug tooling only; production does no probe copies. */
     int16_t intpl_pre_ir[4] = {0,0,0,0};
     int32_t intpl_pre_fc[3] = {0,0,0};
-    if (func == 0x11) {
+    { if (func == 0x11 && g_psx_diag_gte) {
         intpl_pre_ir[0]=gte.IR0; intpl_pre_ir[1]=gte.IR1;
         intpl_pre_ir[2]=gte.IR2; intpl_pre_ir[3]=gte.IR3;
         intpl_pre_fc[0]=gte.FC[0]; intpl_pre_fc[1]=gte.FC[1]; intpl_pre_fc[2]=gte.FC[2];
-    }
+      } }
 #endif
     gte_run_command(&gte, cmd);
     pgxp_gte_op_end(func);               /* IR / MAC scalars the op overwrote */
@@ -2398,6 +2409,15 @@ static void gte_execute_impl(CPUState* cpu, uint32_t cmd, bool charge_latency) {
         static int s_sib_avsz = -1;
         static int s_sib_bias = 0;
         static int s_sib_force_idx = -1;
+        if (!g_psx_diag_gte && s_sib_batch < 0) {
+            /* First RTP of the run: decide once whether this probe family is
+             * wanted, so a plain gameplay run pays one check thereafter. */
+            const char *e = std::getenv("PSX_ND_SIB_OT_BATCH");
+            const char *a = std::getenv("PSX_ND_SIB_OT_AVSZ");
+            if ((e && *e && *e != '0') || (a && *a && *a != '0'))
+                g_psx_diag_gte = 1;
+        }
+        if (!g_psx_diag_gte) goto nd_sib_done;
         if (s_sib_batch < 0) {
             const char *e = std::getenv("PSX_ND_SIB_OT_BATCH");
             s_sib_batch = (e && *e && *e != '0') ? 1 : 0;
@@ -2446,6 +2466,7 @@ static void gte_execute_impl(CPUState* cpu, uint32_t cmd, bool charge_latency) {
                 }
             }
         }
+nd_sib_done: ;
     }
 #endif
 
